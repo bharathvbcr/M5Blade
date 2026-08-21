@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon\r
+._*
+.Spotlight-V100
+.Trashes
+
+# Swift Package Manager & Build Artifacts
+.build/
+.swiftpm/
+Products/
+*.zip
+*.dmg
+*.sha256
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# Editor & Local Settings
+.claude/settings.local.json
+.vscode/
+*.swp
+*~
+*.bak
+*.orig
+
+# Logs & Database runtime files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log

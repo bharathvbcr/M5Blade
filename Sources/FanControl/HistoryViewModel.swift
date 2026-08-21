@@ -90,8 +90,10 @@ final class HistoryViewModel: ObservableObject {
     // MARK: - Loading
 
     private func scheduleReload() {
+        loadGeneration += 1
+        let generation = loadGeneration
         reloadTask?.cancel()
-        reloadTask = Task { await reload() }
+        reloadTask = Task { await reload(expectedGeneration: generation) }
     }
 
     /// Bumped by every load. Two can be in flight at once — the five-second
@@ -101,7 +103,7 @@ final class HistoryViewModel: ObservableObject {
     /// what the user just deselected.
     private var loadGeneration = 0
 
-    func reload() async {
+    func reload(expectedGeneration: Int? = nil) async {
         let window: ClosedRange<Date>
         if let focus {
             window = focus
@@ -110,8 +112,13 @@ final class HistoryViewModel: ObservableObject {
             window = end.addingTimeInterval(-range.duration)...end
         }
 
-        loadGeneration += 1
-        let generation = loadGeneration
+        let generation: Int
+        if let expectedGeneration {
+            generation = expectedGeneration
+        } else {
+            loadGeneration += 1
+            generation = loadGeneration
+        }
         isLoading = true
         defer { if generation == loadGeneration { isLoading = false } }
 

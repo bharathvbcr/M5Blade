@@ -50,16 +50,23 @@ final class InsightsViewModel: ObservableObject {
     // MARK: - Loading
 
     private func scheduleReload() {
+        loadGeneration += 1
+        let generation = loadGeneration
         reloadTask?.cancel()
-        reloadTask = Task { await reload() }
+        reloadTask = Task { await reload(expectedGeneration: generation) }
     }
 
-    func reload() async {
+    func reload(expectedGeneration: Int? = nil) async {
         let end = Date()
         let window = end.addingTimeInterval(-range.duration)...end
 
-        loadGeneration += 1
-        let generation = loadGeneration
+        let generation: Int
+        if let expectedGeneration {
+            generation = expectedGeneration
+        } else {
+            loadGeneration += 1
+            generation = loadGeneration
+        }
         isLoading = true
         defer { if generation == loadGeneration { isLoading = false } }
 

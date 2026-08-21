@@ -15,7 +15,7 @@ APP_DIR      = Products/$(APP_NAME)
 BUNDLE_ID    = com.fancontrol.app
 ICON         = Resources/AppIcon.icns
 
-.PHONY: all build test probe icon app install uninstall clean ci:local ci-local package release verify
+.PHONY: all build test probe icon app install uninstall clean ci\:local ci-local package release verify
 
 all: build
 
@@ -64,10 +64,10 @@ verify: app
 	@test -x $(APP_DIR)/Contents/Resources/uninstall-helper.sh
 	@echo "App bundle verification passed."
 
-ci:local: test app verify package
+ci\:local: test app verify package
 	@echo "==> Local CI validation passed completely."
 
-ci-local: ci:local
+ci-local: ci\:local
 
 install: app
 	@sudo $(APP_DIR)/Contents/Resources/install-helper.sh "$(PWD)/$(APP_DIR)"

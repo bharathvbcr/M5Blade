@@ -248,7 +248,9 @@ final class AppModel: ObservableObject {
                                                floor: safetyFloor)
             }
         } catch {
-            status = .unverifiedOS("SMC unavailable")
+            if fans.isEmpty {
+                status = .unverifiedOS("SMC unavailable")
+            }
         }
         scheduleTimer()
     }

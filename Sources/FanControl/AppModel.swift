@@ -322,7 +322,10 @@ final class AppModel: ObservableObject {
         // that long on every sample, so it runs off it. `TemperatureSources` is
         // an actor, so awaiting it already hops off the main actor — no detached
         // task is needed to get the work off this thread.
-        temperatures = await sources.readAll()
+        let readTemps = await sources.readAll()
+        if !readTemps.isEmpty || temperatures.isEmpty {
+            temperatures = readTemps
+        }
         // Only sensors whose subsystem is established may set this — the number
         // every fan curve reads. That excludes calibration references, which is
         // the rule this had before (`PMU tcal` reports a constant 51.8 °C that
@@ -332,11 +335,11 @@ final class AppModel: ObservableObject {
         // source off the set is unchanged.
         let hottest = TemperatureSources.attributed(temperatures)
             .max { $0.celsius < $1.celsius }
-        maxTempC = hottest?.celsius
+        maxTempC = hottest?.celsius ?? maxTempC
         // Which part of the machine is hottest, not just how hot. Without it a
         // spike record cannot tell "the graphics cores got hot" from "the SSD
         // did", and those have completely different answers.
-        hottestGroup = hottest.map { SensorCategory.classify($0.name).rawValue } ?? ""
+        hottestGroup = hottest.map { SensorCategory.classify($0.name).rawValue } ?? hottestGroup
         // Hold the previous value rather than falling to zero. `cpuUsage` returns
         // nil when it has no previous sample to difference against — the first
         // tick, and any tick whose window was too short to accumulate a scheduler

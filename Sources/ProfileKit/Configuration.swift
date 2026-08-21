@@ -160,6 +160,7 @@ public struct ConfigStore: Sendable {
                 "Invalid UTF-8 encoding — the old file was kept at \(backup.lastPathComponent)")
         }
         do {
+            _ = try JSONSerialization.jsonObject(with: data, options: [])
             return try JSONDecoder().decode(Configuration.self, from: data)
         } catch {
             // Preserve the file — a decode failure is usually a shape change, and

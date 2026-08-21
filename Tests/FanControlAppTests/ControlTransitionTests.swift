@@ -263,15 +263,18 @@ final class ControlTransitionTests: XCTestCase {
                               temperatures: Fixture.temperatures(4))
 
         let arming = expectation(description: "arming has started")
+        let release = Latch()
         let first = OneShot()
         daemon.beforeSetManual = { @Sendable _, _ in
-            if first.claim() { arming.fulfill() }
-            try? await Task.sleep(nanoseconds: 20_000_000)
+            guard first.claim() else { return }
+            arming.fulfill()
+            await release.wait()
         }
 
         let enable = Task { await self.model.enableControl() }
         await fulfillment(of: [arming], timeout: 5)
         await model.tickForTesting()
+        release.open()
         await enable.value
 
         XCTAssertGreaterThan(model.controlGate.skippedTicks, 0)

@@ -152,6 +152,13 @@ public struct ConfigStore: Sendable {
         } catch {
             throw StoreError.unreadable(error.localizedDescription)
         }
+        guard String(data: data, encoding: .utf8) != nil else {
+            let backup = url.deletingPathExtension()
+                .appendingPathExtension("invalid-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.moveItem(at: url, to: backup)
+            throw StoreError.unreadable(
+                "Invalid UTF-8 encoding — the old file was kept at \(backup.lastPathComponent)")
+        }
         do {
             return try JSONDecoder().decode(Configuration.self, from: data)
         } catch {

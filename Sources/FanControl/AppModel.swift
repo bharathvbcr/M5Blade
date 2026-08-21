@@ -181,10 +181,10 @@ final class AppModel: ObservableObject {
                                                recordsProcessNames: recordsNames)
         applyConfiguration(store.loadOrDefault(fanCount: 2))
         thermalMonitor = ThermalMonitor { [weak self] pressure in
-            Task { @MainActor in self?.thermalPressure = pressure }
+            Task { @MainActor [weak self] in self?.thermalPressure = pressure }
         }
         daemon.onDisconnect = { [weak self] generation in
-            Task { @MainActor in self?.noteConnectionDropped(generation: generation) }
+            Task { @MainActor [weak self] in self?.noteConnectionDropped(generation: generation) }
         }
     }
 
@@ -294,7 +294,7 @@ final class AppModel: ObservableObject {
                    repeating: interval,
                    leeway: .milliseconds(Int(interval * 100)))
         t.setEventHandler { [weak self] in
-            Task { @MainActor in await self?.tick() }
+            Task { @MainActor [weak self] in await self?.tick() }
         }
         t.resume()
         timer = t

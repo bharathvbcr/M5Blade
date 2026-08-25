@@ -2,6 +2,10 @@
 
 **Date:** 2026-08-10 · **Machine:** Mac17,8 (Apple M5 Pro, 64 GiB), macOS 27.0 (26A5388g)
 **Baseline before this work:** 515 tests, 0 failures · **After:** 553 tests, 0 failures
+**Roadmap update (2026-08-21):** T-1 through T-5 implemented — **614 tests, 0 failures**, three consecutive runs.
+**Enhancement pass (2026-08-21):** nine UX/perf enhancements implemented — **644 tests, 0 failures**.
+**Hardening audit (2026-08-22):** eleven defects fixed across four subsystems — **675 tests, 0 failures**, soak seeds 1–10 clean, release build warning-free. See §Hardening audit below.
+**Power telemetry fix (2026-08-22):** "0W" readout traced to broken platform Energy Model counters (powermetrics ground truth) plus three app-side fabrication defects — per-series withdrawal, zero-is-not-data, honest formatting. See §Power telemetry below.
 
 Two symptoms were reported. Both were real, both are fixed, and the investigation
 turned up seven further defects of the same class plus one environmental hazard
@@ -24,6 +28,7 @@ user acts on) · **M**edium (latent, or wrong under load) · **L**ow (polish)
 | I-9 | **C** | A second fan controller (Macs Fan Control) is installed and running as root on this machine | **Open — needs a decision from you** |
 | I-10 | L | `SystemMetrics.swapUsage()` is public API with no caller | Open — left alone |
 | I-11 | H | A refused pre-sleep release left the fans pinned and said nothing | **Fixed** (found by the new soak) |
+| I-12 | **H** | macOS 27 beta maintains no Energy Model telemetry on this machine — `powermetrics` itself reports **0 mW** for CPU/GPU/ANE/DRAM/Combined — and the app turned that into a permanent fabricated "0W" readout | Platform: unfixable here, recheck each beta. App: **Fixed** (see §Power telemetry below) |
 
 ---
 
@@ -31,11 +36,11 @@ user acts on) · **M**edium (latent, or wrong under load) · **L**ow (polish)
 
 | Task ID | Target Area | Description | Priority | Status |
 |---|---|---|---|---|
-| **T-1** | System / UX | Detect concurrent root fan controllers (Macs Fan Control, etc.) and alert user (`ISSUES.md` I-9) | High | **Planned** |
-| **T-2** | SensorKit | Remove unreferenced public API `SystemMetrics.swapUsage()` (`ISSUES.md` I-10) | Low | **Planned** |
-| **T-3** | Settings / PowerKit | Surface Battery Charge Limit (80%/100%) UI controls (`DESIGN.md` §8) | Medium | **Planned (Phase 7)** |
-| **T-4** | Notifications | Dispatch UserNotifications on sustained throttle / thermal pressure (`DESIGN.md` §3.4) | Medium | **Planned (Phase 7)** |
-| **T-5** | Dashboard | Add CPU/GPU Package Power charting in Swift Charts (`DESIGN.md` §8) | Low | **Planned (Phase 7)** |
+| **T-1** | System / UX | Detect concurrent root fan controllers (Macs Fan Control, etc.) and alert user (`ISSUES.md` I-9) | High | **Done** |
+| **T-2** | SensorKit | Remove unreferenced public API `SystemMetrics.swapUsage()` (`ISSUES.md` I-10) | Low | **Done** |
+| **T-3** | Settings / PowerKit | Surface Battery Charge Limit (80%/100%) UI controls (`DESIGN.md` §8) | Medium | **Done** — read-only surfacing + opt-in write path (see §T-3 below) |
+| **T-4** | Notifications | Dispatch UserNotifications on sustained throttle / thermal pressure (`DESIGN.md` §3.4) | Medium | **Done** — see §T-4 below |
+| **T-5** | Dashboard | Add CPU/GPU Package Power charting in Swift Charts (`DESIGN.md` §8) | Low | **Done** — see §T-5 below |
 
 ---
 
@@ -103,7 +108,8 @@ one place knows which is which, and `PopoverView` uses it.
 **Reported as:** "switching between profiles and stock triggers fan failure
 errors, but a second click resolves it."
 
-**Confirmed from this machine's own helper log** (`/var/log/fancontrold.log`),
+**Confirmed from this machine's own helper log** (`/var/log/fancontrold.log` at
+the time; the helper is now `m5bladed` logging to `/var/log/m5bladed.log`),
 twice — 2026-08-08 23:41:12 and again 2026-08-10 18:55:22:
 
 ```
@@ -130,7 +136,7 @@ notice. A second click worked because by then no tick was in flight.
 The daemon side never had this problem — `DaemonCore` is an actor, so its requests
 serialise. The app was the outlier.
 
-**Fix.** `Sources/FanControl/ControlGate.swift`, a new component with two
+**Fix.** `Sources/M5Blade/ControlGate.swift`, a new component with two
 mechanisms because the two failures are different:
 
 * **Exclusion** — one fan-control operation at a time. A release can no longer
@@ -150,7 +156,7 @@ under this app and one under macOS is two controllers in one thermal envelope.
 `start()`, `noteWillSleep()`, and the new `noteWillTerminate()` take the same
 barrier.
 
-**Tests.** `Tests/FanControlAppTests/ControlTransitionTests.swift` — 7 tests
+**Tests.** `Tests/M5BladeAppTests/ControlTransitionTests.swift` — 7 tests
 driving a simulated helper that refuses writes to unarmed fans exactly as
 `DaemonCore` does. Verified in both directions: with the gate neutered, 6 of the 7
 fail and reproduce the logged operation sequence verbatim —
@@ -241,13 +247,13 @@ pid 582  /Library/PrivilegedHelperTools/com.crystalidea.macsfancontrol.smcwrite
 ```
 
 **Macs Fan Control's privileged SMC-write helper is loaded and running as root on
-this machine right now.** It writes the same SMC keys `fancontrold` does — `F0md`,
+this machine right now.** It writes the same SMC keys `m5bladed` does — `F0md`,
 `F0Tg` and their fan-1 equivalents. Nothing in either product coordinates with the
 other.
 
 This matters for the report you filed. I-3 fully explains the failures in the log
 and is fixed. But a second root writer can *independently* take a fan out of
-manual mode underneath `fancontrold`, and the symptom would be indistinguishable:
+manual mode underneath `m5bladed`, and the symptom would be indistinguishable:
 `rejected setTarget: fan N is not under manual control`. The fix makes the app
 stop *causing* that; it cannot stop another program causing it.
 
@@ -362,3 +368,264 @@ for s in $(seq 1 30); do FANCONTROL_SOAK_SEED=$s swift test --filter "ControlSoa
   matches the M3/M4 `thermalmonitord` unlock, then ruled out: this is an M5 Pro,
   `Ftst` is absent, and the helper logs `M5-style: direct mode writes, no unlock
   needed`. Left untouched.
+
+---
+
+## Roadmap implementation notes (2026-08-21)
+
+### T-1 · Concurrent controller detection — **Done**
+
+`Sources/M5Blade/ConcurrentControllerDetector.swift`. Verified unprivileged
+detection is possible on this machine: `/Library/LaunchDaemons/*.plist` are
+world-readable (Macs Fan Control's job confirmed present), and
+`sysctl(KERN_PROC_ALL)` reports all 135 root processes with uid and the
+16-byte command name — `proc_name()` returns nothing cross-user. Matching
+survives kernel truncation (`com.crystalidea.macsfancontrol.smcwrite` →
+`com.crystalidea`). Known signatures for Macs Fan Control, TG Pro, iStat Menus,
+smcFanControl and Lubbbo plus a generic root-daemon-named-like-a-fan-tool rule;
+Apple's own daemons and this app's helper are excluded by construction.
+Surfaced as a banner in the popover, a section in Settings → General, and a
+unified-log notice; re-scanned at most once a minute from the sampling tick.
+
+On this machine today the detector reports *Macs Fan Control — installed*
+(plist + helper binary present, not currently running). I-9's advice stands:
+`sudo launchctl bootout system/com.crystalidea.macsfancontrol.smcwrite`, or
+delete both files, to rule it out.
+
+### T-2 · `swapUsage()` removed — **Done**
+
+Deleted; no references existed outside ISSUES.md/README.
+
+### T-3 · Battery & charge limit — **Done**, two stages
+
+Measured first: this Mac17,8 exposes 3626 SMC keys and **neither CHWA nor BCLM
+is among them**; `AppleSmartBattery` carries health data but no temperature or
+permanent-failure keys. Byte semantics were verified against `zackelia/bclm`
+(CHWA: `0x01`=80 %, `0x00`=full; BCLM: percent) rather than folklore.
+
+Stage A (`Sources/PowerKit/BatteryHealth.swift`): unprivileged IORegistry read
+of charge %, cycle count, Apple-smoothed and raw capacity figures — both shown
+together with DESIGN §6.2's disagreement explained, never alone.
+
+Stage B (`ChargeLimit.swift`, `ChargeLimitController.swift`,
+`DaemonCore/ChargeLimitPolicy.swift`): XPC `getChargeLimit`/`setChargeLimit`,
+daemon-side validation to exactly {80, 100}, capability gate, no-battery gate,
+and a mandatory read-back that treats "firmware ignored it" as failure. All of
+it sits behind an explicit opt-in toggle default-off, because §6.3 recommends
+against third-party limiting. Two measured caveats surfaced honestly in the UI:
+this Mac has no key (controls disabled with an explanation pointing at System
+Settings), and macOS ≥ 15 refuses these writes to non-Apple processes even as
+root.
+
+### T-4 · Throttle notifications — **Done**
+
+`ThrottleAlerter.swift`: pure decision engine + `UNUserNotificationCenter`
+delivery behind a protocol. Rules per DESIGN §3.5 — authorization requested
+lazily on the first alert-worthy event, one alert per episode after 120 s
+sustained, ≥ 15 min between any two alerts, repeats coalesced into "Nth episode
+in the last hour", `.critical` pressure alerts without the load gate but under
+the same limiter, recovery deliberately silent. Events ride on the same
+`HistoryRecorder.record` transition the recorder persists, so what history
+records and what the user was told cannot drift. Ambient case handled by the
+status item: orange while throttling or pressure ≥ serious, red at critical,
+plus an accessibility value. A General-tab toggle turns the feature off without
+touching history or detection; a denial is recorded once, never re-prompted.
+
+### T-5 · Package power — **Done**, with one honest limitation
+
+New `CIOReport` target wraps libIOReport (the symbols left IOKit's tbd in
+macOS 27). Signatures were *measured*, not assumed: this generation takes five
+arguments on `IOReportCopyChannelsInGroup`, returns a query dictionary, needs a
+mutable copy passed to subscription with a **NULL task port** (a real port
+faults inside libIOReport), and names channels via
+`IOReportChannelGetChannelName`. Arithmetic is unit-tested directly; a physics
+ceiling rejects unit mix-ups as "no data" instead of drawing megawatts.
+
+Measured limitation: on this macOS 27 beta / M5 Pro firmware the CPU Energy
+counter does not accumulate (zero delta under idle *and* four `yes` burners),
+and GPU Energy deltas are ~2×10⁹/s — implausible under any sane unit. Ten
+consecutive motionless samples withdraw the reading entirely. So power series
+are absent here by design: a dead counter must not draw an idle-cool machine
+(DESIGN §2.1's quietest-failure rule). `smcfan power` remains for verifying
+channels on other machines/releases.
+
+### Verification
+
+| What | Result |
+|---|---|
+| Test suite | **614 tests, 0 failures**, three consecutive runs (baseline 553) |
+| New suites | ConcurrentControllerTests 17 · ThrottleAlerterTests 17 · PowerKitTests 9 · ChargeLimitModelTests 5 · AlertAndDetectorStressTests 3 · PackagePowerTests 10 |
+| Soak seeds 1–5 | ControlSoakTests + ControlTransitionTests clean |
+| Randomised alert soak | 6 seeds × 3000-event streams: no alert pair closer than 15 min; none under threshold; critical-only pressure wording holds |
+| Detector fuzz | 200 random plist/process worlds: own helper and Apple daemons never reported, output deduped and sorted, every report evidenced |
+| Release build | Clean, no warnings; `make app` + `make verify` pass |
+| Live probe | `smcfan probe`, `smcfan keys`, `smcfan power` against real hardware |
+
+### Deliberate gaps
+
+* Charge-limit controls are inert on hardware without CHWA/BCLM — measured true
+  here, and expected to become the common case.
+* Power charting is inert where the Energy Model counters are frozen or
+  rescaled — currently true on this machine; `smcfan power` decides per host.
+
+---
+
+## Enhancement pass (2026-08-21)
+
+Nine improvements, each verified by tests that fail against the pre-change
+code where the change is logic. 614 → **644 tests**, all passing; release
+build clean.
+
+| # | Area | What changed |
+|---|---|---|
+| E-1 | Curve editor | Keyboard operation (UI.md §3): handles are focusable buttons — Tab walks them, arrows nudge (Option = fine step), Delete removes. Plus a point table: one editable numeric row per point. All three input paths share `clampedMove`, so the keyboard and the table cannot author a curve the drag cannot. |
+| E-2 | Reduce Motion | The nudge animation honours `accessibilityDisplayShouldReduceMotion`. A grep-verified audit found no other animated surface in the app to honour it on; the constraint now has a caller so it cannot be forgotten when motion appears. |
+| E-3 | Charts a11y | History and Sensors plots expose full audio-graph descriptors (`ChartAccessibility`): epoch-second x-axis with a time-rendering provider (the API has no date axis), y-range bracketing every series, points capped at 120 per series keeping both endpoints. |
+| E-4 | Undo | Every curve-draft edit is ⌘Z-able via the environment undo manager through one `mutate` choke point that refuses no-op writes; one drag is one undo entry. `registerUndo(withTarget:)` needs a class, so the target is a small box reading/writing the draft's `@State` storage through closures. |
+| E-5 | Stale fan readings | A failed fan read used to leave a frozen rpm on screen forever looking live (`AppModel.sample`'s `try?`). Readings now carry their last-success timestamp (`readingsUpdatedAt`); past `readingStalenessLimit` (10 s, mirroring `ControlLoop.stalenessLimit`) the popover shows a *stale* badge and VoiceOver reads "reading out of date". |
+| E-6 | Diagnostics | `DiagnosticsReport` + **Copy Diagnostics** in Settings › General: status, fans (with staleness), problems, settings, platform, and the last 20 control-state transitions. All `status` writes now flow through `setStatus(_:reason:)`, which records changes only — `applyControl` restates `.controlling` every tick and would otherwise flood the log. Bounded at 100 entries. |
+| E-7 | Status-item readout modes | Full / temperature-only / icon-only (`StatusDisplayMode`), persisted and re-read defensively; formatting lives in one pure function (`StatusDisplayMode.title`) that tests pin for all three modes including missing-data placeholders. |
+| E-8 | Watching sampling rate | Optional 15 s cadence while macOS owns the fans (`WatchingSampleRate`), default unchanged at 5 s. Control stays 1 Hz (AUDIT A-6). The trade — coarser history while watching — is stated in the toggle, not discovered later. |
+| E-9 | PackagePower dormancy | After a counter is declared frozen, IOReport queries stop entirely until a probe due 10 minutes later; waking from dormancy re-baselines rather than differencing across the gap (which would report microwatts). On this machine — dead counters since macOS 27 beta — this removes a wasted subscription+sample pair from every tick. |
+
+Process-walk gating (the other candidate under E-9) already existed:
+`needsProcessSampling` gates the pid walk on an open automation editor,
+opted-in attribution above its demand gates, or live per-app rules.
+
+### Verification
+
+| What | Result |
+|---|---|
+| Test suite | **644 tests, 0 failures** (baseline 614); release build clean, no warnings |
+| New suites | StatusPreferenceTests 9 · DiagnosticsReportTests 8 · ChartAccessibilityTests 6 · EnhancementRenderTests 4 · plus render coverage of the stale badge and new Settings sections |
+| Descriptor data | Values round-trip through `AXDataPoint` (unpacked via KVC — the wrapper's Swift property name is ambiguous); empty input yields valid axes, not refused ranges |
+| Curve-editor invariants | Drag/keyboard/table all route through `clampedMove`; render-tested at 2 and at the 12-point cap |
+
+---
+
+## Hardening audit (2026-08-22)
+
+A four-subsystem audit (sensors, history, daemon, app) found eleven defects.
+Every logic change ships with a test that fails against the pre-fix code.
+
+| # | Sev | Finding | Fix |
+|---|---|---|---|
+| H-1 | **H** | `AppModel` held the last temperature set forever when reads came back empty — fan curves evaluated a frozen input and `ControlLoop`'s stale-data release was unreachable after the first success | `temperaturesUpdatedAt` + staleness limit; stale input feeds the loop as nil, which drives the designed hold-then-release ladder. Scripted sensor seam added so the production tick path is testable |
+| H-2 | M | `SystemMetrics` minted a Mach send-right *reference* on every poll (`mach_host_self()` inline, never deallocated; ~2/tick at 1 Hz). Measured: urefs climb to the kernel's per-name ceiling of **65,535** after ~9 h of control, then pin — the kernel keeps returning the shared right, so readings do not die (an earlier draft of this row claimed they did); the defect is unbounded-by-design resource accounting, not an outage | Port acquired once through a factory seam, cached for process lifetime; a stress test asserts 800 polls move the kernel's reference counter by zero |
+| H-3 | **H** | `LiveWindow` evicted a whole series when its key missed one batch — one failed fan read wiped up to 15 min of sparkline | Eviction keyed on newest-point age vs window, not batch presence |
+| H-4 | **H** | `uninstall-helper.sh`'s fan restore checked `/usr/local/libexec/smcfan`, which nothing ever installs — the step never ran, and "Done." printed over possibly pinned fans | Uses the bundled tool beside the script, verifies mode read-back, honest failure text |
+| H-5 | M-H | Legacy DB migration: three independent `try?` byte copies could tear a live WAL database, then latch the bad target forever | SQLite online-backup API; partial output removed on failure so next launch retries |
+| H-6 | M-H | Daemon watchdog gave up permanently after ~6 s of refused releases — fans pinned until a client re-armed — while logging `.givingUp` at 1 Hz into an unrotated file (~7 MB/day) | One attempt per 60 s after the fast budget; give-up logged on transition only |
+| H-7 | M | One finite garbage heartbeat (TTPD's −306783232 °C) disabled the daemon's independent hard floor | Heartbeat sanitized with `PlausibleTemperature.admits`; implausible → floor applies |
+| H-8 | M | A transient SMC `open()` failure latched an empty sensor catalogue until relaunch | Failures leave the catalogue unset and retry on a 5 s cooldown; genuine no-keys answers still latch |
+| H-9 | M | Counter reset across sleep produced genuine `0.0 W` instead of nil — violating PackagePower's own nil-vs-zero contract | Backwards delta → nil ("no measurement"); test re-pinned with justification |
+| H-10 | M | First-run consent requested from the status-item menu was parked invisibly: the alert lives in popover/settings only | Menu actions that park consent open the panel, which hosts the dialog |
+| H-11 | M | Give-up path labelled a live, answering helper "Helper not running" and offered reinstall | Release result decides: confirmed → Watching + clean; refused → Watching + explanation; unreachable → Helper-not-running |
+
+Also fixed en route: `ChargeLimitPolicy` rejected `false` batteries but accepted *unreported* ones, contradicting its comment · `reconcileUnconfirmed` deliberately leaves the watchdog clock alone (documented — an unverified release means we hold the fan; startup adoption is the only case that grants grace) · notification denial was permanent for the process lifetime while the UI claimed System Settings would fix it — now retried on a 5 min cooldown and self-recovering · charge-limit UI stated "not supported" when the real state was "unknown" · CSV export honoured neither its own documented column contract nor formula-injection safety, and lacked a BOM · `clear()` reset recorder state before the fallible DB clear · config saves fired per keystroke/drag-tick, washing out the backup rotation during one drag (now coalesced 400 ms, flushed on quit) · export wrote silently or as a zero-byte file · installer booted out the working helper before staging its replacement and never verified process liveness; directories it relies on are now ownership-checked · `lastLoggedUnconfirmed` data race between overlapping watchdog tasks closed with scoped locking · dead `enableControl()` selector removed from StatusItemController.
+
+### Verification
+
+| What | Result |
+|---|---|
+| Test suite | **675 tests, 0 failures** (baseline 644); release build clean, no warnings |
+| New suites/tests | LiveWindow eviction ×2 · SMC recovery ×2 · migration ×2 · heartbeat plausibility ×2 · charge-limit policy ×4 · temperature-staleness ×2 · give-up honesty ×1 · host-port ×1 · CSV contract ×1 · alert cooldown ×2 (one re-pinned with justification) |
+| Control soak seeds 1–6 | ControlSoakTests + ControlTransitionTests clean per seed |
+| Daemon/gate soak seeds 7–10 | clean per seed |
+| Mach-port probe | 200k uncapped calls → urefs 1→65,535 then plateau; cached right flat across 200k polls — measured on this machine, and encoded as a permanent test |
+| WarningBanner VoiceOver | fix follows Apple's combine-descriptive-content-only pattern; render tests guard layout. Headless runtime AX verification is impossible (SwiftUI builds its tree only when an assistive client attaches; the xctest runner gets AX cannotComplete −25208) — manual check with Accessibility Inspector: banner shows one static-text element "Warning. …" plus a separate focusable button. Not yet performed |
+| I-9 Macs Fan Control | helper binary + LaunchDaemon plist still installed (root:wheel, Jul 11), service NOT loaded, no process running. Removal/disable requires sudo — commands left to the user below |
+| `make app` + `make verify` | pass |
+
+### Still needs you
+
+```bash
+# I-9: the plist in /Library/LaunchDaemons will be loaded at every boot until
+# removed or disabled. bootout alone is moot while it isn't running:
+sudo launchctl disable system/com.crystalidea.macsfancontrol.smcwrite   # survive reboots
+sudo rm /Library/LaunchDaemons/com.crystalidea.macsfancontrol.smcwrite.plist
+sudo rm "/Library/PrivilegedHelperTools/com.crystalidea.macsfancontrol.smcwrite"
+```
+
+---
+
+## Power telemetry: "0W" in the panel (2026-08-22)
+
+**Symptom.** The popover's watt readout showed `0W` permanently (or vanished).
+
+**Investigation** — measured, not assumed:
+
+* `smcfan power` reproduced it: CPU pinned at 0.00 W, GPU always "—".
+* Raw IOReport probes: with six `yes` burners holding ~97 % CPU busy,
+  `CPU Energy` and *every* cluster counter (`MCPU0/1`, `PCPU`, `PACC_*`,
+  `MCPM*`, `PCPM`, `DRAM0`) sat at exactly +0 delta across 1 s, 2 s and 20 s
+  windows for minutes; a single +36 M burst appeared once in ~2 min of
+  probing. A brand-new subscription in a brand-new process reads the same
+  frozen value byte-for-byte — the staleness is upstream of any subscription.
+* The SMC's float `P*` keys move but are temperatures (36–63 under load that
+  does not move them like watts), and battery amperage is 0 on AC — no
+  alternative source exists on this hardware.
+* **Ground truth**: Apple's own `sudo powermetrics` reports CPU Power
+  **0 mW**, GPU Power **0 mW**, ANE/DRAM/Combined **0 mW** — macOS 27.0 beta
+  (27A5416b), Mac17,8. The platform telemetry is broken below everything this
+  app can reach.
+
+Three app-side defects then converted a dead platform counter into a
+confident lie, each now fixed with tests that fail against the old code:
+
+| # | Defect | Fix |
+|---|---|---|
+| P-1 | An exact-zero delta passed the plausibility check and rendered as `0.0 W`. An idle package burns tens of millijoules per second against a one-mJ counter resolution, so zero over a real interval is firmware silence, never idleness | `watts(delta:)` maps zero to nil; the UI shows absence, not zero |
+| P-2 | Frozen-counter withdrawal required *both* channels to freeze simultaneously (`cpuDelta == 0 && gpuDelta == 0`). The GPU channel ticks constantly here (with an implausible ~3×10⁹/s scale), so its motion reset the shared streak forever and CPU's zombie survived every check the class was written to enforce | Per-series state machine (`PackagePower.Series`): each channel tracks silence, implausibility and dormancy independently |
+| P-3 | `%.0fW` rounded every reading below half a watt down to `0W` — on healthy machines too, indistinguishable from P-1's fabrication | `PowerText.watts`: one decimal below 10 W, integer above, `—` for absent; accessibility label uses the same text |
+
+Hardening added while there: lazy-flush bursts are attributed across the
+whole quiet span (a +36 M flush divided by one tick rendered as absurd
+spikes; now averaged since the counter last moved, capped at 120 s);
+implausible bursts count toward withdrawal exactly like silence; sleep-style
+counter resets restart the accumulation window without counting as breakage;
+both series withdrawn skips the IOReport query entirely (wake probe once per
+10 min); `smcfan power` names the suspected cause when nothing measures; the
+diagnostics report gained a Package power row so "why no watts?" is answerable
+in-app. On healthy hardware nothing changes except honest sub-watt rendering:
+counters that move every tick publish per-tick watts as before.
+
+### Verification
+
+| What | Result |
+|---|---|
+| Test suite | **697 tests, 0 failures** |
+| New tests | 19 for this fix: per-series state machine ×12 (silent-run withdrawal, lazy-flush averaging, stale-window cap, same-instant resample, implausible run, single-glitch recovery, counter reset, missing channel, wake probe, steady tick, zero-delta policy, diagnostics summary) · watt formatter ×4 · report row ×1 · concurrent-sampling smoke ×1 · live plausibility re-pinned to reject zero |
+| Live behaviour | `smcfan power`: `—` from tick 2 onward, withdrawal after the silent run, hint printed; matches `powermetrics`'s all-zero ground truth |
+
+### Still needs you
+
+Nothing actionable — but re-check `smcfan power` after each macOS beta bump.
+When Apple fixes the counters, watts reappear with no code change; until then
+their absence here is the designed, honest state.
+
+---
+
+## Panel availability readout (2026-08-22)
+
+The popover's system row gained a second line: **available memory** and **free
+disk space**. Requested for the expanded menu bar rather than the at-a-glance
+title, whose width stays as it was.
+
+* `MemoryUsage.available` is the complement of `used` on the same basis — not
+  `free + cachedFiles`, an identity that fails by 4.6 GB on this very fixture,
+  because the kernel's page categories do not sum to physical memory.
+* Disk uses `.volumeAvailableCapacityForImportantUsageKey` — Finder's
+  "available", which counts purgeable caches — formatted by the new
+  `StorageFormat` (1e9-based): the storage convention `MemoryFormat`
+  deliberately does not own.
+* Sampled once per tick beside CPU and memory (one statfs call), published only
+  on change like they are.
+
+### Verification
+
+| What | Result |
+|---|---|
+| Test suite | **704 tests, 0 failures** (baseline 697); release build clean |
+| New tests | AvailabilityReadoutTests ×3 (tick wiring through the production path, render with the row, one-sided + absurd values) · SystemMetricsTests ×4 (complement definition including the identity it replaces, saturation, storage convention, live statfs) |
+| Flake fixed en route | `testCPUPercentagesAreAWholeMachine` bounded `total ≤ 100` exactly; four rounded percentages were measured summing to 100.00000000000001 between two runs of the identical code — now checked with the same tolerance as the partition assertion above it |

@@ -45,14 +45,41 @@ final class LiveWindowTests: XCTestCase {
         XCTAssertEqual(window.points(for: "a").count, 25)
     }
 
-    /// A sensor that stops reporting should disappear rather than leave a frozen
-    /// line on the chart.
+    /// A sensor that stops reporting should fade out when its last point leaves
+    /// the window rather than leave a frozen line on the chart forever.
     func testForgetsSeriesThatStopReporting() {
-        var window = LiveWindow()
+        var window = LiveWindow(window: 10)
         window.record([sample("a", 40), sample("b", 50)], at: start)
-        window.record([sample("a", 41)], at: start.addingTimeInterval(1))
-        XCTAssertEqual(window.points(for: "b").count, 0)
-        XCTAssertEqual(window.points(for: "a").count, 2)
+        // b misses batches but is still inside the window…
+        for i in 1...5 {
+            window.record([sample("a", Double(40 + i))],
+                          at: start.addingTimeInterval(Double(i)))
+        }
+        XCTAssertEqual(window.points(for: "b").count, 1,
+                       "a missed batch must not erase history that is still fresh")
+        // …and ages out once its last point leaves the window.
+        window.record([sample("a", 46)], at: start.addingTimeInterval(11))
+        XCTAssertEqual(window.points(for: "b").count, 0,
+                       "stale series must eventually be forgotten")
+        XCTAssertEqual(window.points(for: "a").count, 6,
+                       "the surviving series must be untouched by the eviction")
+    }
+
+    /// The regression this exists for: one tick without a key used to delete
+    /// every stored point for that series — up to fifteen minutes at the
+    /// controlling rate — because eviction keyed on *presence in this batch*
+    /// instead of on staleness. A single failed fan read or an empty power
+    /// sample made the sparkline go blank and refill over minutes.
+    func testASingleMissedBatchKeepsTheSeries() {
+        var window = LiveWindow(window: 900)
+        for i in 0..<60 {
+            window.record([sample("fan0.rpm", 1200), sample("power.cpu", 8)],
+                          at: start.addingTimeInterval(Double(i)))
+        }
+        // The power counter answers nothing this tick; the fan read failed.
+        window.record([sample("fan0.rpm", 1210)], at: start.addingTimeInterval(60))
+        XCTAssertEqual(window.points(for: "power.cpu").count, 60,
+                       "one missed sample wiped the whole power trace")
     }
 
     func testSpanReportsActualCoverageNotTheWindow() {

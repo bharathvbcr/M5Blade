@@ -1,4 +1,4 @@
-# Design Audit — Fan_Control
+# Design Audit — M5Blade
 
 **Scope:** the architecture proposed in `FEASIBILITY.md`, audited for a Mac-only (Apple Silicon M5) environment.
 **Date:** 2026-08-08 · **Status:** pre-implementation review
@@ -214,7 +214,7 @@ Worth keeping explicitly, since the list above is all criticism:
 
 ## A-14 · Deep Audit Findings & Architectural Verification (2026-08-10)
 
-A comprehensive code-level audit was conducted across all 11 modules (`SMCKit`, `FanKit`, `ProfileKit`, `SensorKit`, `HistoryKit`, `DaemonProtocol`, `DaemonCore`, `SimSupport`, `fancontrold`, `smcfan`, `FanControlApp`).
+A comprehensive code-level audit was conducted across all 11 modules then present (`SMCKit`, `FanKit`, `ProfileKit`, `SensorKit`, `HistoryKit`, `DaemonProtocol`, `DaemonCore`, `SimSupport`, `m5bladed`, `smcfan`, `M5BladeApp` — named `fancontrold`/`FanControlApp` at the time; the project has since been renamed M5Blade. `PowerKit` and `CIOReport` arrived later with T-3 and T-5).
 
 ### Verified Subsystems & Guarantees:
 1. **`SMCKeyData` Layout & Bounds:**

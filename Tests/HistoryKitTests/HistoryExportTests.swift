@@ -33,6 +33,9 @@ final class HistoryExportTests: XCTestCase {
         let data = try HistoryExport.data(format: .csv, store: store,
                                           from: now.addingTimeInterval(-60), to: now, now: now)
         return String(decoding: data, as: UTF8.self)
+            // The file carries a UTF-8 BOM so Excel renders the `°C` headers;
+            // strip it here so line assertions stay about content.
+            .drop(while: { $0 == "\u{FEFF}" })
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
     }
@@ -107,6 +110,28 @@ final class HistoryExportTests: XCTestCase {
         let data = try HistoryExport.data(format: .csv, store: store,
                                           from: now.addingTimeInterval(-7_200),
                                           to: now.addingTimeInterval(-3_600), now: now)
-        XCTAssertEqual(String(decoding: data, as: UTF8.self), "timestamp_unix,timestamp_iso\n")
+        XCTAssertEqual(String(decoding: data, as: UTF8.self),
+                       "\u{FEFF}timestamp_unix,timestamp_iso\n")
+    }
+
+    /// A sensor known to the catalogue but with no rows in the window keeps its
+    /// column — an absent column and an empty one mean different things.
+    func testACatalogueSensorWithoutRowsInTheWindowKeepsItsColumn() throws {
+        try store.insert([
+            (date: now.addingTimeInterval(-90),
+             samples: [RecordedSample(sensor: SensorDescriptor(key: "temp:cold",
+                                                                name: "=Cold", kind: .temperature,
+                                                                group: "CPU"),
+                                      value: 5.0)]),
+        ])
+        let data = try HistoryExport.data(format: .csv, store: store,
+                                          from: now.addingTimeInterval(-60), to: now, now: now)
+        let header = String(decoding: data, as: UTF8.self)
+            .drop(while: { $0 == "\u{FEFF}" })
+            .split(separator: "\n")[0]
+        XCTAssertTrue(header.contains("CPU (°C)"), "present sensor keeps its column")
+        // A name a spreadsheet would treat as a formula arrives inert.
+        XCTAssertTrue(header.contains("'=Cold (°C)"),
+                      "formula-leading names are neutralized: \(header)")
     }
 }

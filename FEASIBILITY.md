@@ -2,6 +2,12 @@
 
 **Target:** Apple Silicon M5 · **Signing:** free Apple Developer account · **Date:** 2026-08-08
 
+> *Point-in-time study, written before implementation. The shipped project is
+> **M5Blade**: the daemon binary is `m5bladed` (installed by
+> `Scripts/install-helper.sh` with cdhash pinning per AUDIT A-2, not the manual
+> `cp` sequence below), and the UI module is `Sources/M5Blade`. Names and
+> commands below are the originals; see `README.md` for how it actually built.*
+
 ---
 
 ## 1. Verdict

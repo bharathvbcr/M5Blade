@@ -1,5 +1,6 @@
 import Foundation
 import FanKit
+import PowerKit
 import DaemonProtocol
 
 /// The privileged half's decision-making, with no XPC and no globals.
@@ -78,14 +79,68 @@ public actor DaemonCore {
     /// answer. Empty on healthy hardware, so it costs nothing in the normal case.
     private var unconfirmed = Set<Int>()
     private var releaseRetries = 0
+    /// When the slow-cadence retry after giving up may run again.
+    private var nextSlowRetry: Date?
     private var lastReleaseOutcome: ReleaseOutcome?
     /// Set once the watchdog has fired and not yet been cleared by a fresh
     /// heartbeat, so a client that stopped talking cannot resume driving fans
     /// simply by sending another `setTarget`.
     private var watchdogTripped = false
 
-    public init(backend: FanBackend) {
+    public init(backend: FanBackend, chargeLimit: ChargeLimitController? = nil) {
         self.backend = backend
+        self.chargeLimit = chargeLimit
+    }
+
+    // MARK: - Charge limit (DESIGN §6.3)
+
+    private let chargeLimit: ChargeLimitController?
+
+    /// The firmware charge-limit state. Nil controller means the daemon was
+    /// built without one, which reports as unsupported — indistinguishable,
+    /// deliberately, from hardware that has no key.
+    public func chargeLimitStatus() async -> ChargeLimitStatus {
+        guard let chargeLimit else { return .unsupported }
+        let (state, support) = await chargeLimit.status()
+        guard support.isSupported else { return .unsupported }
+        return ChargeLimitStatus(supported: true, percent: state.percent,
+                                 keyName: support.hasAppleSiliconKey ? "CHWA" : "BCLM")
+    }
+
+    /// Applies policy, writes through the controller, and reports what the
+    /// read-back verified — never what the write claimed.
+    public func setChargeLimit(percent: Int) async -> Result<Void, ChargeLimitWriteFailure> {
+        guard let chargeLimit else {
+            return .failure(ChargeLimitWriteFailure(
+                reason: "this helper was built without charge-limit control"))
+        }
+        let battery = BatteryReader.read()
+        switch ChargeLimitPolicy.validate(percent: percent,
+                                          support: await chargeLimit.support(),
+                                          batteryInstalled: battery?.batteryInstalled) {
+        case .failure(let rejection):
+            return .failure(ChargeLimitWriteFailure(
+                reason: Self.chargeLimitRejectionText(rejection)))
+        case .success:
+            break
+        }
+        switch await chargeLimit.set(percent: percent) {
+        case .success:
+            return .success(())
+        case .failure(let error):
+            return .failure(ChargeLimitWriteFailure(reason: error.message))
+        }
+    }
+
+    static func chargeLimitRejectionText(_ rejection: ChargeLimitPolicy.Rejection) -> String {
+        switch rejection {
+        case .unsupportedPercent(let requested):
+            return "only 80 or 100 may be set (asked for \(requested))"
+        case .noFirmwareKey:
+            return "this Mac's SMC exposes no charge-limit key; use System Settings → Battery"
+        case .noBattery:
+            return "this Mac has no battery to limit"
+        }
     }
 
     // MARK: - Lifecycle
@@ -174,7 +229,14 @@ public actor DaemonCore {
     // MARK: - Requests
 
     public func heartbeat(maxTempC: Double, at now: Date) {
-        lastHeartbeat = (maxTempC, now)
+        // A finite-but-absurd temperature must not reach the clamp as
+        // "measured": one reading of TTPD's −306783232 °C would otherwise read
+        // as an ice-cold machine and switch the daemon's independent hard floor
+        // *off* — the exact input the floor exists to survive. Implausible
+        // values are stored as NaN, which `TemperatureEvidence.from` maps to
+        // `.unknown`, and unknown applies the floor.
+        let plausible = PlausibleTemperature.admits(maxTempC) ? maxTempC : .nan
+        lastHeartbeat = (plausible, now)
         watchdogTripped = false
         releaseRetries = 0
     }
@@ -326,6 +388,13 @@ public actor DaemonCore {
         for index in unconfirmed.sorted() {
             guard let userControlled = await observedUserControl(fan: index) else { continue }
             unconfirmed.remove(index)
+            // Deliberately no clock here, unlike `recordManualState`: this fan
+            // was OURS moments ago — an unverified release means we wrote auto
+            // and could not look — so there is no live-client grace window to
+            // grant. A fresh `manualSince` would delay reclaiming a fan that is
+            // still spinning by a whole watchdog period; the pre-existing
+            // evidence (usually a stale heartbeat) is the correct clock basis,
+            // and a genuinely live client refreshes everything by its next beat.
             if userControlled { manualFans.insert(index) } else { manualFans.remove(index) }
         }
         if manualFans.isEmpty { manualSince = nil }
@@ -386,10 +455,10 @@ public actor DaemonCore {
         await reconcileUnconfirmed()
 
         if watchdogTripped {
-            // Already released once; keep retrying only while something is still
-            // under manual control and we have retries left.
+            // Already released once; keep retrying while something is still
+            // under manual control — fast at first, then at the slow cadence.
             guard !manualFans.isEmpty else { return .idle }
-            return await retryRelease()
+            return await retryRelease(now: now)
         }
 
         // Nothing is under manual control, so there is nothing to take back and
@@ -405,25 +474,63 @@ public actor DaemonCore {
         // window belonging to the one that just armed.
         let evidence = [lastHeartbeat?.at, manualSince].compactMap { $0 }.max()
         guard let since = evidence else { return await trip() }
-        guard now.timeIntervalSince(since) > DaemonConstants.watchdogTimeout else { return .idle }
+        // The stamps are wall-clock `Date`s and wall clocks are stepped: back by
+        // an NTP correction, forward across a resume. Measuring the age signed
+        // fails open in the dangerous direction. A step *back* past `since`
+        // makes the age negative, which reads as "no time has passed", so a dead
+        // client's fans stayed pinned until wall time crawled past the stamp —
+        // hours for a large correction. Silence across a jump *forward*, on the
+        // other hand, is genuine staleness and must keep tripping.
+        //
+        // Reading the age as a magnitude covers both. The error it admits is
+        // bounded: a correction smaller than the whole grace window still ages
+        // out within one extra period once wall time passes the stamp, and a
+        // live client refreshes its stamp about once a second, so a trip it did
+        // not deserve is cleared by its very next beat (`heartbeat` resets
+        // `watchdogTripped`). One spurious release cycle versus unbounded
+        // pinning is the right side to err on — releasing is the reversible
+        // direction everywhere else in this daemon too.
+        guard abs(now.timeIntervalSince(since)) > DaemonConstants.watchdogTimeout else {
+            return .idle
+        }
         return await trip()
     }
 
     private func trip() async -> WatchdogAction {
         watchdogTripped = true
         releaseRetries = 0
+        nextSlowRetry = nil
         let outcome = await releaseAll()
         if outcome.isComplete { return .released(outcome) }
         releaseRetries = 1
         return .releaseIncomplete(outcome, attempt: 1)
     }
 
-    private func retryRelease() async -> WatchdogAction {
-        // Bounded: hardware that has rejected the same write five times is not
-        // going to accept the sixth, and hammering it once a second forever is a
-        // spin, not a recovery. The state stays visible instead.
+    private func retryRelease(now: Date) async -> WatchdogAction {
+        // Bounded: hardware that has rejected the same write five times in six
+        // seconds is not going to accept the sixth, and hammering it once a
+        // second forever is a spin, not a recovery. But "give up" used to mean
+        // *forever*: the retry budget was spent within seconds of the trip, and
+        // hardware (or thermalmonitord) that stops refusing minutes later never
+        // saw another attempt — the fans stayed pinned until a client re-armed.
+        // After the fast budget is spent, one attempt per slow interval keeps
+        // the recovery path alive without spinning.
         guard releaseRetries < DaemonConstants.maxReleaseRetries else {
-            return .givingUp(lastReleaseOutcome ?? ReleaseOutcome())
+            // Entering the slow cadence schedules the first retry rather than
+            // performing it: the fast budget was spent saying no, and one more
+            // immediate write against hardware that just refused five writes is
+            // the spin this branch exists to prevent.
+            guard let next = nextSlowRetry else {
+                nextSlowRetry = now.addingTimeInterval(DaemonConstants.slowReleaseRetryInterval)
+                return .givingUp(lastReleaseOutcome ?? ReleaseOutcome())
+            }
+            guard now >= next else {
+                return .givingUp(lastReleaseOutcome ?? ReleaseOutcome())
+            }
+            nextSlowRetry = now.advanced(by: DaemonConstants.slowReleaseRetryInterval)
+            let outcome = await releaseAll()
+            if outcome.isComplete { return .released(outcome) }
+            return .releaseIncomplete(outcome, attempt: DaemonConstants.maxReleaseRetries + 1)
         }
         releaseRetries += 1
         let outcome = await releaseAll()

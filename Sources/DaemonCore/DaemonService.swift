@@ -1,5 +1,6 @@
 import Foundation
 import FanKit
+import PowerKit
 import DaemonProtocol
 
 /// The XPC surface. Deliberately thin: it translates calls into `DaemonCore`
@@ -11,13 +12,20 @@ public final class DaemonService: NSObject, FanControlDaemonProtocol, @unchecked
     private let core: DaemonCore
     private let log: @Sendable (String) -> Void
     private var watchdogTimer: DispatchSourceTimer?
-    /// Only touched from `runWatchdogTick`, which the timer serialises.
+    /// Presentation state for the unconfirmed-mode notice. The timer's handler
+    /// blocks are serialised, but each block only *spawns* a Task — the tick
+    /// bodies themselves can overlap when one runs long (per-fan SMC reads cost
+    /// tens of milliseconds), so this state is guarded rather than "owned" by
+    /// whichever task happens to be running.
     private var lastLoggedUnconfirmed = Set<Int>()
+    private var loggedGivingUp = false
+    private let logStateLock = NSLock()
     private var signalSources: [DispatchSourceSignal] = []
-    private let timerQueue = DispatchQueue(label: "com.fancontrol.helper.watchdog")
+    private let timerQueue = DispatchQueue(label: "com.m5blade.helper.watchdog")
 
-    public init(backend: FanBackend, log: @escaping @Sendable (String) -> Void = { NSLog("[fancontrold] %@", $0) }) {
-        self.core = DaemonCore(backend: backend)
+    public init(backend: FanBackend, chargeLimit: ChargeLimitController? = nil,
+                log: @escaping @Sendable (String) -> Void = { NSLog("[m5bladed] %@", $0) }) {
+        self.core = DaemonCore(backend: backend, chargeLimit: chargeLimit)
         self.log = log
         super.init()
     }
@@ -49,8 +57,12 @@ public final class DaemonService: NSObject, FanControlDaemonProtocol, @unchecked
         // know what state this fan is in" is the condition every stranded-fan
         // failure passes through on its way to becoming permanent.
         let unconfirmed = await core.unconfirmedFanIndices()
-        if unconfirmed != lastLoggedUnconfirmed {
-            lastLoggedUnconfirmed = unconfirmed
+        let unconfirmedChanged = logStateLock.withLock {
+            let changed = unconfirmed != lastLoggedUnconfirmed
+            if changed { lastLoggedUnconfirmed = unconfirmed }
+            return changed
+        }
+        if unconfirmedChanged {
             if unconfirmed.isEmpty {
                 log("all fan modes verified again")
             } else {
@@ -63,11 +75,27 @@ public final class DaemonService: NSObject, FanControlDaemonProtocol, @unchecked
         case .idle:
             break
         case .released(let outcome):
+            logStateLock.withLock { loggedGivingUp = false }
             log("watchdog timeout — \(outcome.summary)")
         case .releaseIncomplete(let outcome, let attempt):
+            logStateLock.withLock { loggedGivingUp = false }
             log("watchdog release incomplete (attempt \(attempt)) — \(outcome.summary)")
         case .givingUp(let outcome):
-            log("watchdog gave up releasing fans after \(DaemonConstants.maxReleaseRetries) attempts — \(outcome.summary)")
+            // The state is already on disk once; repeating it every second for
+            // as long as the machine stays wedged used to grow an unrotated
+            // /var/log file by megabytes a day without changing what it said.
+            // The slow-cadence retry in DaemonCore produces real released/
+            // incomplete lines when anything changes, so silence here is safe.
+            let first = logStateLock.withLock {
+                if loggedGivingUp { return false }
+                loggedGivingUp = true
+                return true
+            }
+            if first {
+                log("watchdog gave up fast retries after \(DaemonConstants.maxReleaseRetries)"
+                    + " attempts — will keep trying every \(Int(DaemonConstants.slowReleaseRetryInterval))s"
+                    + " — \(outcome.summary)")
+            }
         }
     }
 
@@ -157,6 +185,32 @@ public final class DaemonService: NSObject, FanControlDaemonProtocol, @unchecked
             }
         }
     }
+
+    // MARK: Charge limit
+
+    public func getChargeLimit(reply: @escaping (Data?, String?) -> Void) {
+        Task {
+            let status = await core.chargeLimitStatus()
+            do {
+                reply(try JSONEncoder().encode(status), nil)
+            } catch {
+                reply(nil, String(describing: error))
+            }
+        }
+    }
+
+    public func setChargeLimit(percent: Int, reply: @escaping (Bool, String?) -> Void) {
+        Task {
+            switch await core.setChargeLimit(percent: percent) {
+            case .success:
+                log("charge limit set to \(percent)")
+                reply(true, nil)
+            case .failure(let failure):
+                log("rejected setChargeLimit: \(failure.reason)")
+                reply(false, failure.reason)
+            }
+        }
+    }
 }
 
 /// Rejects any client that isn't the app we shipped alongside this helper.
@@ -174,7 +228,7 @@ public final class DaemonListenerDelegate: NSObject, NSXPCListenerDelegate {
     public func listener(_ listener: NSXPCListener,
                          shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard let requirement else {
-            NSLog("[fancontrold] WARNING: no code signing requirement configured — refusing connection")
+            NSLog("[m5bladed] WARNING: no code signing requirement configured — refusing connection")
             return false
         }
         // Below macOS 13 there is no supported way to pin the peer's code
@@ -183,7 +237,7 @@ public final class DaemonListenerDelegate: NSObject, NSXPCListenerDelegate {
         // this branch is unreachable in practice and exists so that lowering the
         // target cannot silently open the socket.
         guard #available(macOS 13.0, *) else {
-            NSLog("[fancontrold] code signing requirements unavailable on this OS — refusing connection")
+            NSLog("[m5bladed] code signing requirements unavailable on this OS — refusing connection")
             return false
         }
         connection.setCodeSigningRequirement(requirement)

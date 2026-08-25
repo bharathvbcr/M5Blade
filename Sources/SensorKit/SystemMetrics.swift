@@ -65,6 +65,20 @@ public struct MemoryUsage: Sendable, Equatable {
     public var pressure: Double {
         total == 0 ? 0 : min(1, Double(used) / Double(total))
     }
+
+    /// What the machine can still absorb without evicting an application:
+    /// everything not counted as `used`, computed as `total - used` so a
+    /// readout pairing the two cannot disagree. Free pages and cached files are
+    /// the bulk of it; the remainder is memory no category accounts for.
+    ///
+    /// Deliberately not called "free": `free` alone excludes the file cache,
+    /// and charging that cache to the user is the exact mis-report this
+    /// decomposition exists to correct (ISSUES I-1). Saturates like every other
+    /// subtraction in this file — a fabricated sample where `used` exceeds
+    /// `total` must not underflow into an exabyte readout.
+    public var available: UInt64 {
+        total > used ? total - used : 0
+    }
 }
 
 extension MemoryUsage {
@@ -117,6 +131,19 @@ public enum MemoryFormat {
     }
 }
 
+/// Bytes as Finder renders storage: 1e9-based, labelled "GB".
+///
+/// The convention `MemoryFormat` deliberately does not own — its comment names
+/// storage as the opposite convention and points here, so each convention keeps
+/// exactly one place that knows which is which.
+public enum StorageFormat {
+    public static let bytesPerGB: Double = 1e9
+
+    public static func gigabytes(_ bytes: UInt64) -> Double {
+        Double(bytes) / bytesPerGB
+    }
+}
+
 /// Host-level CPU and memory.
 ///
 /// Two Apple Silicon traps handled here (AUDIT A-5):
@@ -142,6 +169,38 @@ public final class SystemMetrics: @unchecked Sendable {
         return (UInt64(info.numer), UInt64(info.denom))
     }()
 
+    // MARK: - Host port
+
+    /// The cached host port.
+    ///
+    /// `mach_host_self()` returns a *new* send right on every call. Both polls
+    /// used to call it inline and drop the right on the floor: at one call each
+    /// per tick, a controller running for days leaked send rights without bound,
+    /// and readings died once the task's port table exhausted. The host port is
+    /// valid for the life of the process, so it is acquired once — through this
+    /// seam, which tests replace to count acquisitions instead of leaking for
+    /// real.
+    internal static var hostPortFactory: () -> mach_port_t = { mach_host_self() }
+    private static let hostPortLock = NSLock()
+    private static var cachedHostPort: mach_port_t?
+
+    internal static func currentHostPort() -> mach_port_t {
+        hostPortLock.lock()
+        defer { hostPortLock.unlock() }
+        if let cached = cachedHostPort { return cached }
+        let port = hostPortFactory()
+        cachedHostPort = port
+        return port
+    }
+
+    /// Test hook: the cache is process-wide by design, so a suite that wants to
+    /// count acquisitions must be able to start from empty.
+    internal static func resetCachedHostPortForTesting() {
+        hostPortLock.lock()
+        cachedHostPort = nil
+        hostPortLock.unlock()
+    }
+
     /// Convert Mach absolute time units to nanoseconds.
     public static func nanoseconds(fromMachTime ticks: UInt64) -> UInt64 {
         ticks * timebase.numer / max(1, timebase.denom)
@@ -152,7 +211,7 @@ public final class SystemMetrics: @unchecked Sendable {
         var info: processor_info_array_t?
         var infoCount: mach_msg_type_number_t = 0
 
-        let result = host_processor_info(mach_host_self(),
+        let result = host_processor_info(Self.currentHostPort(),
                                          PROCESSOR_CPU_LOAD_INFO,
                                          &cpuCount, &info, &infoCount)
         guard result == KERN_SUCCESS, let info else { return nil }
@@ -209,7 +268,7 @@ public final class SystemMetrics: @unchecked Sendable {
                                            MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &stats) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                host_statistics64(Self.currentHostPort(), HOST_VM_INFO64, $0, &count)
             }
         }
         guard result == KERN_SUCCESS else { return nil }
@@ -217,11 +276,19 @@ public final class SystemMetrics: @unchecked Sendable {
                            physicalMemory: ProcessInfo.processInfo.physicalMemory)
     }
 
-    public func swapUsage() -> (used: UInt64, total: UInt64)? {
-        var usage = xsw_usage()
-        var size = MemoryLayout<xsw_usage>.size
-        guard sysctlbyname("vm.swapusage", &usage, &size, nil, 0) == 0 else { return nil }
-        return (usage.xsu_used, usage.xsu_total)
+    /// Free space on a volume, as Finder reports "available": the unallocated
+    /// figure plus space the system can purge on demand (caches, local
+    /// snapshots). The stricter `.volumeAvailableCapacityKey` reads permanently
+    /// low and would disagree with every other number the machine shows.
+    ///
+    /// One statfs call, so it is sampled each tick beside CPU and memory for
+    /// free — and published only on change like they are.
+    public func availableDiskSpace(at url: URL = URL(fileURLWithPath: "/")) -> UInt64? {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let bytes = values?.volumeAvailableCapacityForImportantUsage, bytes >= 0 else {
+            return nil
+        }
+        return UInt64(bytes)
     }
 
     /// Refuse to run under Rosetta — page size and SMC format selection are

@@ -1,6 +1,6 @@
-# Fan_Control — Power Profiles & Feature Design
+# M5Blade — Power Profiles & Feature Design
 
-**Target:** Apple Silicon M5, macOS 26+ · **Reads:** unprivileged · **Writes:** root daemon
+**Target:** Apple Silicon (M-series), macOS 14+ · **Reads:** unprivileged · **Writes:** root daemon
 Companion to `FEASIBILITY.md` (viability) and `AUDIT.md` (design review — **read A-1 and A-2 first**).
 
 ---
@@ -11,15 +11,21 @@ Companion to `FEASIBILITY.md` (viability) and `AUDIT.md` (design review — **re
 Fan_Control/
 ├── Sources/
 │   ├── SMCKit/          IOKit transport, key info, FPE2 ⇄ IEEE-754, actor-serialized
+│   ├── CIOReport/       C shim over libIOReport — Energy Model power counters
 │   ├── SensorKit/       IOHIDEventSystem temps, IOReport power, host_* metrics, libproc
 │   ├── PowerKit/        AppleSmartBattery, IOPowerSources, adapter, charge limit
 │   ├── FanKit/          Fan model, curves, hysteresis, slew, safety floor, ceiling
 │   ├── ProfileKit/      Profiles, rules, resolver, precedence, dwell
-│   ├── HistoryKit/      SQLite time series, downsampling, export
-│   ├── fancontrold/     Root LaunchDaemon — write-only, clamps, watchdog
-│   └── FanControl/      NSStatusItem UI, SwiftUI panels, Swift Charts
-└── Tests/
-    └── SimulationTests/ Thermal simulator + control-loop invariants
+│   ├── HistoryKit/      SQLite time series, downsampling, spikes, throttle episodes, export
+│   ├── DaemonProtocol/  Shared XPC interface — deliberately minimal
+│   ├── DaemonCore/      Daemon policy — write-only validation, clamps, watchdog;
+│   │                    a separate target so it tests without root or hardware
+│   ├── SimSupport/      Test-only thermal simulator + seeded trace generators
+│   ├── m5bladed/        Root LaunchDaemon — write-only, clamps, watchdog
+│   ├── smcfan/          Read-only probe/status CLI
+│   └── M5Blade/         NSStatusItem UI, SwiftUI panels, Swift Charts
+└── Tests/               704 tests across 9 test targets (control loop invariants,
+                         resolver precedence, retention, daemon policy, app view models)
 ```
 
 `SMCKit`, `SensorKit`, `PowerKit`, `HistoryKit` have **no dependency on the daemon** — the entire monitoring app builds and runs without it.
@@ -32,6 +38,8 @@ Two layers: **profiles** define behavior, **rules** select which profile is acti
 
 ### 2.1 Profile
 
+As shipped (`Sources/ProfileKit/Profile.swift`, `Sources/FanKit/ControlLoop.swift`):
+
 ```swift
 struct Profile: Codable, Identifiable, Sendable {
     let id: UUID
@@ -41,24 +49,23 @@ struct Profile: Codable, Identifiable, Sendable {
     // Per-fan, keyed by fan index — see AUDIT A-3
     var fanCurves: [Int: FanCurve]
 
-    // Control loop
-    var ceilingPercent: Double      // default 95
-    var floorPercent: Double        // never below the daemon hard floor
-    var hysteresisC: Double         // default 3.0
-    var slewUpRPMPerSec: Double     // default 200
-    var slewDownRPMPerSec: Double   // default 100
-    var smoothingAlpha: Double      // EMA on temperature input, default 0.3
-    var sampleHz: Double            // default 1.0
+    // Control loop parameters, one set per profile (ControlSettings):
+    // ceilingPercent 95 · hysteresisC 3.0 · slewUpRPMPerSec 200 ·
+    // slewDownRPMPerSec 100 · smoothingAlpha 0.3 (EMA on temperature)
+    var settings: ControlSettings
 
-    var chargeLimitPercent: Int?                 // 80 or 100 on Apple Silicon
+    var releasesToSystem: Bool      // Stock: write mode 0 and hand control back
 }
 
 struct FanCurve: Codable, Sendable {
-    var points: [(tempC: Double, percent: Double)]   // monotonic non-decreasing
-    var sensorIDs: [String]                          // which sensors drive this fan
-    var reduction: Reduction                         // .max (default), .mean
+    var points: [CurvePoint]        // tempC + percent; monotonic non-decreasing,
+                                    // re-normalized on every write
+    var sensorIDs: [String]         // which sensors drive this fan
+    var reduction: SensorReduction  // .max (default), .mean
 }
 ```
+
+Three fields from the original sketch were dropped rather than left unread: `floorPercent` (the floor is `SafetyFloor`'s, computed per tick — never user-authored per profile), `sampleHz` (control is 1 Hz, fixed; the only cadence choice is the watching-mode sample rate), and `chargeLimitPercent` (charge limiting is a machine-level setting behind the daemon, not a property of a fan profile — §6.3).
 
 `sensorIDs` empty means "the machine's hottest sensor", which is what every
 built-in ships with. A mapped curve reads only its own sensors; if every one of
@@ -88,31 +95,37 @@ removed rather than left as a field nothing reads — see §2.6, where the
 
 ### 2.3 Rules
 
+As shipped (`Sources/ProfileKit/Rule.swift`):
+
 ```swift
 struct Rule: Codable, Identifiable, Sendable {
     let id: UUID
     var name: String
     var enabled: Bool
-    var priority: Int              // higher wins
+    // No priority field: order in the list IS the priority — first match wins.
     var conditions: [Condition]    // ALL must hold (AND)
     var targetProfileID: UUID
-    var minDwellSeconds: TimeInterval = 30
+    var minDwell: TimeInterval = 30
+    var debounce: TimeInterval = 5
 }
 
 enum Condition: Codable, Sendable {
     case powerSource(PowerSource)             // .ac / .battery
     case batteryBelow(percent: Int)
-    case thermalState(atLeast: ThermalState)  // .fair / .serious / .critical
-    case processRunning(match: ProcessMatch, sustainedCPU: Double?, forSeconds: TimeInterval?)
+    case thermalAtLeast(ThermalPressure)      // .fair / .serious / .critical
+    case processActive(match: ProcessMatch, sustainedCPU: Double?, forSeconds: TimeInterval?)
     case foregroundApp(bundleID: String)
     case displaysAsleep(Bool)
-    case clamshell(Bool)
     case externalDisplayCount(atLeast: Int)
     case macOSPowerMode(MacOSPowerMode)
     case sustainedLoad(cpuPercent: Double, forSeconds: TimeInterval)
-    case timeOfDay(from: DateComponents, to: DateComponents)
 }
 ```
+
+`clamshell` and `timeOfDay` were specified here and never implemented; they are
+recorded as absent rather than listed among the conditions a rule can use.
+External-display count and display sleep ship, which covers most of the
+clamshell signal's practical ground (§A-8 of the audit tracks the remainder).
 
 ### 2.4 Resolution order — strict precedence
 
@@ -176,23 +189,25 @@ Require corroboration across independent signals before declaring an episode:
 
 ### 3.3 Episode model
 
+As shipped (`Sources/HistoryKit/HistoryModels.swift`):
+
 ```swift
-struct ThrottleEpisode: Codable, Identifiable, Sendable {
-    let id: UUID
+struct ThrottleEpisode: Identifiable, Sendable {
+    var id: Int64                       // database row id
     var start: Date
-    var end: Date?
-    var peakTempC: Double
-    var peakThermalState: ThermalState
+    var end: Date?                      // nil while the episode is still open
+    var peakTempC: Double?
+    var peakPressure: Int               // thermal pressure at the peak
     var meanCPUPercent: Double
-    var fanRPMAtPeak: [Int: Double]
-    var activeProfileName: String
-    var topProcesses: [ProcessAttribution]   // top 3 by CPU-seconds during the window
-    var wasOnBattery: Bool
+    var profileName: String
+    var onBattery: Bool
     var externalDisplayCount: Int
+    var fanRPMAtPeak: [Int: Double]
+    var processes: [ProcessShare]       // top 3 by CPU-seconds during the window
 }
 ```
 
-`topProcesses` is the feature's real value — "your Mac throttled" is noise; "your Mac throttled for 4 minutes and `swift-frontend` accounted for 71% of it" is actionable.
+`processes` is the feature's real value — "your Mac throttled" is noise; "your Mac throttled for 4 minutes and `swift-frontend` accounted for 71% of it" is actionable. It is opt-in (§5.4).
 
 ### 3.4 Sudden spikes — a different question
 
@@ -280,6 +295,7 @@ CREATE TABLE samples (
 ) WITHOUT ROWID;
 
 CREATE TABLE episodes (...);          -- throttle episodes
+CREATE TABLE spikes (...);            -- sudden-rise records (§3.4)
 CREATE TABLE sessions (...);          -- user-marked benchmark windows
 CREATE TABLE profile_changes (ts, profile_id, reason);
 ```
@@ -312,7 +328,7 @@ The history database contains a timestamped record of which applications the use
 - **Switching it off means forget, not stop adding.** An event in progress is still being collected, so both detectors discard what they already hold and the open rows are rewritten without names. A *completed* record keeps its names: destroying data the user already has is `clear()`'s job, and that asks first. Getting this wrong is silent — the toggle reads as off while the file keeps the names and an export carries them.
 - Each record stores whether capture was on **at the time**, so an empty attribution list reads as "not recorded" years later rather than "nothing was responsible" — and the setting can be changed without rewriting the past.
 - Sampling per-process CPU means walking every pid, so it is armed by the signal a spike is made of (a 5 °C climb inside a minute) rather than paid for continuously. That is a cost decision, not a privacy one: nothing is collected while the toggle is off.
-- Store in `~/Library/Application Support/FanControl/`, not a shared location.
+- Store in `~/Library/Application Support/M5Blade/`, not a shared location.
 - CSV/JSON export must warn when the payload includes process names — from a spike as well as from an episode.
 - No network egress. Ever. Don't add the `com.apple.security.network.client` capability and the claim verifies itself.
 
@@ -351,6 +367,8 @@ Useful derived views: cycles vs. Apple's 1000-cycle rating; capacity trend over 
 - It doubles the daemon's write surface for a feature the OS already provides — directly against A-2.
 
 If you implement it anyway: detect Apple's setting first and refuse to engage when it is active.
+
+**Status.** Shipped, per the "if you implement it anyway" branch — read-only surfacing always, plus a write path behind an explicit opt-in that defaults **off** (ISSUES §T-3). The daemon validates requests to exactly {80, 100}, gates on the key's presence and a battery being present, and treats a read-back that disagrees with the request as failure. Measured on this machine: no `CHWA`/`BCLM` key exists (3626 SMC keys enumerated), so the controls are inert here with an explanation pointing at System Settings — expected to become the common case as Apple tightens these writes.
 
 ### 6.4 Per-process energy attribution
 
@@ -398,3 +416,5 @@ Amended from `FEASIBILITY.md` to front-load the audit fixes:
 | **7** | Throttle detection, per-app rules, battery analytics | Feature complete |
 
 Phase 3 before Phase 4 is deliberate: with history already recording, the first fan write becomes a measurable experiment instead of a guess.
+
+**Status: all phases shipped.** The roadmap items that came after (T-1 through T-5 — concurrent-controller detection, battery/charge-limit surfacing, notifications, package power charting) are tracked and closed in `ISSUES.md`.

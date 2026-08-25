@@ -1,6 +1,7 @@
 import Foundation
 
-public let fanControlMachServiceName = "com.fancontrol.helper"
+public let fanControlMachServiceName = "com.m5blade.helper"
+public let m5bladeMachServiceName = "com.m5blade.helper"
 
 /// The daemon's entire interface.
 ///
@@ -20,11 +21,48 @@ public let fanControlMachServiceName = "com.fancontrol.helper"
     /// The panic path. Returns every fan to macOS.
     func releaseAll(reply: @escaping (Bool, String?) -> Void)
 
-    /// Must be called at least every `heartbeatInterval`. Two missed beats and
-    /// the watchdog releases the fans.
+    /// Proof of life from the controlling app. The app sends this about once a
+    /// second while it is driving fans. If no heartbeat *and* no arm arrives for
+    /// more than `DaemonConstants.watchdogTimeout` (12 s), the watchdog releases
+    /// every fan to macOS — so the effective tolerance is roughly twelve beats,
+    /// not two. The age is measured as a magnitude on the stamps' wall clock,
+    /// which makes the release survive a system clock stepped backwards past
+    /// the last stamp rather than pinning the fans until wall time catches up.
     func heartbeat(maxTempC: Double, reply: @escaping (Bool) -> Void)
 
     func readFans(reply: @escaping (Data?, String?) -> Void)
+
+    /// Firmware charge-limit state (DESIGN §6.3): read-only for the app; only
+    /// the helper may touch the SMC key. Encoded as JSON `ChargeLimitStatus`
+    /// for the same reason `readFans` is.
+    func getChargeLimit(reply: @escaping (Data?, String?) -> Void)
+
+    /// Sets the firmware charge limit to 80 or 100. Refused on unsupported
+    /// hardware and verified by read-back; a write the firmware ignored is
+    /// reported as a failure, not as success.
+    func setChargeLimit(percent: Int, reply: @escaping (Bool, String?) -> Void)
+}
+
+/// What the helper knows about the firmware charge limit, as JSON across XPC.
+public struct ChargeLimitStatus: Codable, Sendable, Equatable {
+    /// Whether this machine exposes a charge-limit key at all.
+    public var supported: Bool
+    /// 80 or 100 when known; nil when the state cannot be decoded or the
+    /// hardware has no key.
+    public var percent: Int?
+    /// Which firmware key backs the state, when there is one ("CHWA"/"BCLM").
+    public var keyName: String?
+
+    public init(supported: Bool, percent: Int?, keyName: String? = nil) {
+        self.supported = supported
+        self.percent = percent
+        self.keyName = keyName
+    }
+
+    /// The state a machine with no charge-limit key reports. Common enough on
+    /// current Macs that it deserves its one obvious encoding.
+    public static let unsupported = ChargeLimitStatus(supported: false,
+                                                      percent: nil, keyName: nil)
 }
 
 /// Where `install-helper.sh` puts the three files the helper needs to exist.
@@ -37,9 +75,9 @@ public let fanControlMachServiceName = "com.fancontrol.helper"
 /// fault: the only thing the user was told was that the fans were not confirmed
 /// back on macOS control.
 public enum HelperInstallation {
-    public static let launchDaemonPlistPath = "/Library/LaunchDaemons/com.fancontrol.helper.plist"
-    public static let executablePath = "/usr/local/libexec/fancontrold"
-    public static let clientRequirementPath = "/Library/Application Support/FanControl/client.requirement"
+    public static let launchDaemonPlistPath = "/Library/LaunchDaemons/com.m5blade.helper.plist"
+    public static let executablePath = "/usr/local/libexec/m5bladed"
+    public static let clientRequirementPath = "/Library/Application Support/M5Blade/client.requirement"
 
     /// What is actually on disk. Not "is it running" — launchd owns that — but
     /// enough to distinguish the two failures above.
@@ -113,9 +151,13 @@ public enum DaemonConstants {
     /// slack is allowed; an unbounded target is not.
     public static let overspeedAllowance: Double = 1.05
     /// How many consecutive incomplete releases the watchdog retries before it
-    /// stops re-arming and just keeps logging. Bounded, because an unbounded
-    /// retry against hardware that is never going to answer is a spin.
+    /// stops the fast retry loop. Bounded, because an unbounded retry against
+    /// hardware that is never going to answer is a spin — but giving up used to
+    /// mean *forever*, so after this budget one attempt per slow interval keeps
+    /// the recovery path alive.
     public static let maxReleaseRetries = 5
+    /// The cadence of the post-budget retry described above.
+    public static let slowReleaseRetryInterval: TimeInterval = 60
 
     /// The daemon's hard clamp, as a pure function so it can be tested without
     /// root or hardware. Lives here rather than inside the daemon so there is one

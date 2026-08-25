@@ -48,10 +48,22 @@ public struct LiveWindow: Sendable {
             series[sample.sensor.key] = points
         }
 
-        // Forget series that stopped reporting, so a chart doesn't keep a frozen
-        // line for a sensor that has gone away.
-        let live = Set(samples.map(\.sensor.key))
-        series = series.filter { live.contains($0.key) }
+        // Forget series whose newest point has aged out of the window, so a
+        // chart does not keep a frozen line for a sensor that has gone away.
+        //
+        // Keyed on staleness rather than on presence in this batch: a single
+        // failed read used to erase up to fifteen minutes of history for that
+        // series (one skipped fan reading or an empty power sample is routine),
+        // and the plot refilled only as fast as new samples arrived. A sensor
+        // that stops reporting now fades out exactly when its last point leaves
+        // the window — which is also what "gone away" looks like in time.
+        let cutoff = date.addingTimeInterval(-window)
+        series = series.filter { points in
+            guard let newest = points.value.last?.date else { return false }
+            // Future-dated points survive a backwards clock step until they are
+            // trimmed by the normal path above, so keep them here too.
+            return newest >= cutoff || newest > date
+        }
     }
 
     public func points(for key: String) -> [SeriesPoint] { series[key] ?? [] }

@@ -202,7 +202,7 @@ let variants: [(String, Int)] = [
 
 do {
     let iconset = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("FanControl-\(getpid()).iconset")
+        .appendingPathComponent("M5Blade-\(getpid()).iconset")
     try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: iconset) }
 

@@ -45,13 +45,12 @@ public enum HistoryExport {
         let series = try store.series(keys: sensors.map(\.key), from: from, to: to,
                                       targetPoints: fullResolution, now: now)
         guard !series.isEmpty else {
-            return Data("timestamp_unix,timestamp_iso\n".utf8)
+            return Data(("\u{FEFF}timestamp_unix,timestamp_iso\n").utf8)
         }
 
         // Columns follow the sensor catalogue, not the query result, so a sensor
         // with no data in this window still gets a column — an absent column and
         // an empty one mean different things.
-        let columns = sensors.filter { sensor in series.contains { $0.id == sensor.key } }
         var byKey: [String: [Date: Double]] = [:]
         var dates = Set<Date>()
         for entry in series {
@@ -60,15 +59,15 @@ public enum HistoryExport {
         }
 
         var output = "timestamp_unix,timestamp_iso"
-        for column in columns {
-            output += ",\(escape("\(column.name) (\(column.kind.unit))"))"
+        for sensor in sensors {
+            output += ",\(escape("\(sensor.name) (\(sensor.kind.unit))"))"
         }
         output += "\n"
 
         for date in dates.sorted() {
             output += "\(Int64(date.timeIntervalSince1970)),\(iso.string(from: date))"
-            for column in columns {
-                if let value = byKey[column.key]?[date] {
+            for sensor in sensors {
+                if let value = byKey[sensor.key]?[date] {
                     output += ",\(String(format: "%.2f", value))"
                 } else {
                     output += ","
@@ -76,13 +75,23 @@ public enum HistoryExport {
             }
             output += "\n"
         }
-        return Data(output.utf8)
+        // A byte-order mark, because the headers carry `°C` and a BOM-less UTF-8
+        // file is mojibake in Excel under several locales.
+        return Data(("\u{FEFF}" + output).utf8)
     }
 
     /// RFC 4180: quote anything containing a comma, quote, or newline, and
     /// double the quotes inside. Sensor names come from a private API — they are
     /// not ours to assume are well behaved.
+    ///
+    /// A leading `=`/`+`/`-`/`@`/tab would otherwise reach Excel or Numbers as a
+    /// formula rather than as text; those cells are neutralized with a leading
+    /// apostrophe, the standard spreadsheet convention.
     private static func escape(_ field: String) -> String {
+        var field = field
+        if let first = field.first, "=+-@ \t\r".contains(first) {
+            field = "'" + field
+        }
         guard field.contains(where: { $0 == "," || $0 == "\"" || $0 == "\n" || $0 == "\r" }) else {
             return field
         }

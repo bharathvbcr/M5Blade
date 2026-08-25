@@ -67,8 +67,6 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            Products/FanControl-arm64.zip
-            Products/FanControl-arm64.zip.sha256
             Products/M5Blade-arm64.zip
             Products/M5Blade-arm64.zip.sha256
         env:

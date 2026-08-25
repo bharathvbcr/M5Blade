@@ -1,6 +1,7 @@
 import Foundation
 import SMCKit
 import FanKit
+import DaemonProtocol
 import SensorKit
 
 // smcfan — Phase 1 probe tool.
@@ -28,9 +29,11 @@ func usage() {
 
     USAGE
       smcfan probe              Verify hardware support (read-only, start here)
+      smcfan status             Privileged helper: installed, pinned, running?
       smcfan fans               List fans with current rpm and mode
       smcfan sensors [--smc]    List temperature sensors (--smc adds the SMC's own)
       smcfan keys <prefix>      Dump SMC keys matching a prefix, e.g. F0
+      smcfan power [seconds]    CPU/GPU package watts via IOReport (read-only)
       smcfan watch [seconds]    Live readout until interrupted
       smcfan set <fan> <rpm>    Set target rpm            (requires root)
       smcfan auto [fan]         Return fan(s) to macOS    (requires root)
@@ -192,24 +195,185 @@ func listSensors(includeSMC: Bool) async {
     }
 }
 
+/// Live CPU/GPU package power, so the IOReport channel names, deltas and unit
+/// scaling are verified against this machine rather than assumed. The first
+/// sample only establishes the baseline — exactly what the app's reader does.
+func probePower(seconds: Int) async {
+    let power = PackagePower()
+    guard power.isAvailable else {
+        err("IOReport subscription refused — package power unavailable on this macOS")
+        return
+    }
+    out("IOReport subscribed. First sample establishes the baseline.")
+    var last: PackagePower.Sample?
+    var everMeasured = false
+    let deadline = Date().addingTimeInterval(TimeInterval(seconds))
+    while Date() < deadline {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let sample = power.sample()
+        let cpu = sample.cpuWatts.map { String(format: "%6.2f W", $0) } ?? "   —  "
+        let gpu = sample.gpuWatts.map { String(format: "%6.2f W", $0) } ?? "   —  "
+        out("cpu \(cpu)   gpu \(gpu)")
+        if sample.cpuWatts != nil || sample.gpuWatts != nil { everMeasured = true }
+        last = sample
+    }
+    _ = last
+    // Silence has a cause worth naming. A subscription that answers with
+    // counters that never move is a platform fault — measured on macOS 27
+    // beta, where Apple's own `powermetrics` reports 0 mW for every rail.
+    if !everMeasured {
+        err("")
+        err("No measurement in \(seconds)s. If the machine is not truly idle at")
+        err("counter resolution, the firmware is not maintaining these channels.")
+        err("Cross-check with: sudo powermetrics -i 1000 -n 3 --samplers cpu_power,gpu_power")
+    }
+}
+
+
 func dumpKeys(prefix: String) async {
     let smc = SMCConnection()
     try? await smc.open()
-    let suffixes = ["Ac", "Tg", "Mn", "Mx", "Md", "md", "Sf", "Tp"]
-    for s in suffixes {
-        let key = SMCKey(prefix + s)
+    // Enumerate what the machine actually exposes rather than probing a table
+    // of guessed names — the whole point of this tool. `allKeys` costs ~12 ms
+    // once; guessing suffixes silently reports nothing on any Mac whose key
+    // spelling differs from the guess, which is exactly the failure this
+    // command exists to rule out.
+    let all: [SMCKey]
+    do {
+        all = try await smc.allKeys()
+    } catch {
+        err("key enumeration failed — \(error)")
+        await smc.close()
+        return
+    }
+    var printed = 0
+    for key in all where key.description.hasPrefix(prefix) {
         guard let info = try? await smc.keyInfo(key) else { continue }
         let value = try? await smc.read(key)
         let decoded = value?.doubleValue.map { String(format: "%.2f", $0) } ?? "—"
         out(String(format: "%@  type %@  size %d  r%@w%@  = %@",
                    key.description, info.typeString, info.dataSize,
                    info.isReadable ? "+" : "-", info.isWritable ? "+" : "-", decoded))
+        printed += 1
     }
+    if printed == 0 { out("(no keys match prefix “\(prefix)” among \(all.count))") }
     await smc.close()
 }
 
-func watch(seconds: Int) async {
-    let backend = SMCFanBackend()
+/// `smcfan status` — everything needed to answer "why won't the app reach the
+/// helper", which is the one support question this project keeps generating:
+/// a rebuilt app changes its cdhash, the installed helper pins the old one,
+/// and every connection is refused until the helper is reinstalled.
+///
+/// Read-only and unprivileged. It reports what is on disk and in launchd's
+/// domain, the pinned signature, and — when this binary is running from inside
+/// an app bundle — whether that bundle's cdhash still matches the pin. Talking
+/// to the helper over XPC would prove more but requires being the pinned app,
+/// so presence of the process is as far as probing goes from here.
+func runStatus() {
+    out("Helper install state")
+    switch HelperInstallation.state() {
+    case .installed:
+        out("  state      : installed")
+    case .notInstalled:
+        out("  state      : NOT INSTALLED — no launchd job and/or no helper binary")
+    case .installedWithoutClientRequirement:
+        out("  state      : installed WITHOUT a pinned client signature")
+        out("               (the helper refuses every connection in this state)")
+    }
+
+    func present(_ path: String) -> String {
+        FileManager.default.fileExists(atPath: path) ? "present" : "absent"
+    }
+    out("  plist      : \(present(HelperInstallation.launchDaemonPlistPath))  (\(HelperInstallation.launchDaemonPlistPath))")
+    out("  binary     : \(present(HelperInstallation.executablePath))  (\(HelperInstallation.executablePath))")
+
+    // Is the daemon actually alive? `pgrep -x` matches the process name only,
+    // needs no privileges, and says nothing rather than guessing when absent.
+    let pgrep = Process()
+    pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    pgrep.arguments = ["-x", "fancontrold"]
+    pgrep.standardOutput = Pipe()
+    pgrep.standardError = Pipe()
+    let running = (try? pgrep.run()) != nil && pgrep.waitUntilExit(timeout: 5) && pgrep.terminationStatus == 0
+    out("  process    : \(running ? "running" : "not running (launchd starts it on demand or at boot)")")
+
+    let requirementPath = HelperInstallation.clientRequirementPath
+    if let pinned = try? String(contentsOfFile: requirementPath, encoding: .utf8) {
+        out("  pinned     : \(pinned.trimmingCharacters(in: .whitespacesAndNewlines))")
+    } else {
+        out("  pinned     : unreadable or missing (\(requirementPath))")
+    }
+
+    // When run from inside M5Blade.app — the installed layout puts this
+    // binary in Contents/Resources — compare that bundle against the pin. A
+    // bare build directory has nothing to compare, and saying so beats a
+    // misleading "match". Bundle.main does not resolve for plain executables,
+    // so the bundle is found by walking up from this binary's own path.
+    func enclosingAppBundle() -> String? {
+        let resolved = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        var directory = resolved.deletingLastPathComponent()
+        while directory.path != "/" {
+            if directory.pathExtension == "app" { return directory.path }
+            directory = directory.deletingLastPathComponent()
+        }
+        return nil
+    }
+    guard let appPath = enclosingAppBundle() else {
+        out("")
+        out("(not running from an app bundle — no cdhash comparison)")
+        return
+    }
+    let codesign = Process()
+    codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    // Three v's: ad-hoc signatures (this project's kind) only print CDHash
+    // at maximum verbosity.
+    codesign.arguments = ["-dvvv", appPath]
+    let pipe = Pipe()
+    codesign.standardOutput = pipe
+    codesign.standardError = pipe   // codesign writes the detail block to stderr
+    if (try? codesign.run()) != nil, codesign.waitUntilExit(timeout: 5),
+       codesign.terminationStatus == 0,
+       let data = try? pipe.fileHandleForReading.readToEnd(),
+       let detail = String(data: data, encoding: .utf8),
+       let cdhashLine = detail.split(separator: "\n").first(where: { $0.contains("CDHash=") }),
+       let hash = cdhashLine.split(separator: "=").last {
+        let pinnedLine = (try? String(contentsOfFile: requirementPath, encoding: .utf8)) ?? ""
+        let match = pinnedLine.contains(hash)
+        out("  this app   : \(appPath)")
+        out("  cdhash     : \(hash) — \(match ? "matches the pin" : "DOES NOT match the pin — reinstall the helper")")
+    } else {
+        out("  this app   : \(appPath) — cdhash unavailable (unsigned?)")
+    }
+
+    let logPath = FileManager.default.isReadableFile(atPath: "/var/log/m5bladed.log")
+        ? "/var/log/m5bladed.log"
+        : "/var/log/fancontrold.log"
+    if FileManager.default.isReadableFile(atPath: logPath),
+       let log = try? String(contentsOfFile: logPath, encoding: .utf8) {
+        let tail = log.split(separator: "\n").suffix(5)
+        if !tail.isEmpty {
+            out("")
+            out("Last log lines (\(logPath)):")
+            for line in tail { out("  \(line)") }
+        }
+    }
+}
+
+extension Process {
+    /// Bounded wait: a status command must never hang on an external tool.
+    @discardableResult
+    func waitUntilExit(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while isRunning {
+            if Date() > deadline { terminate(); return false }
+            usleep(20_000)
+        }
+        return true
+    }
+}
+
+func watch(seconds: Int) async {    let backend = SMCFanBackend()
     let sensors = TemperatureSensors()
     let metrics = SystemMetrics()
     try? await backend.connect()
@@ -281,9 +445,11 @@ func runCommand(_ args: [String]) async -> Int32 {
     guard let command = args.first else { usage(); return 0 }
     switch command {
     case "probe":   await runProbe()
+    case "status":  runStatus()
     case "fans":    await listFans()
     case "sensors": await listSensors(includeSMC: args.contains("--smc"))
     case "keys":    await dumpKeys(prefix: args.count > 1 ? args[1] : "F0")
+    case "power":   await probePower(seconds: args.count > 1 ? Int(args[1]) ?? 5 : 5)
     case "watch":   await watch(seconds: args.count > 1 ? Int(args[1]) ?? 30 : 30)
     case "set":
         guard args.count > 2, let fan = Int(args[1]), let rpm = Double(args[2]) else {

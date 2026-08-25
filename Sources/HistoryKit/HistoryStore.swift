@@ -184,7 +184,7 @@ public final class HistoryStore {
     }
 
     private func loadSensorIDs() throws {
-        let statement = try database.prepare("SELECT id, key FROM sensors")
+        let statement = try database.cachedStatement("SELECT id, key FROM sensors")
         while try statement.step() {
             sensorIDs[statement.string(1)] = statement.int64(0)
         }
@@ -193,13 +193,18 @@ public final class HistoryStore {
     // MARK: - Meta
 
     private func meta(_ key: String) throws -> Int64? {
-        let statement = try database.prepare("SELECT value FROM meta WHERE key = ?")
+        let statement = try database.cachedStatement("SELECT value FROM meta WHERE key = ?")
         statement.bind(1, key)
-        return try statement.step() ? statement.int64(0) : nil
+        guard try statement.step() else { return nil }
+        let value = statement.int64(0)
+        // Drain before returning: a cached statement stopped mid-result stays
+        // open, and an open statement is what made VACUUM refuse to run.
+        try statement.drain()
+        return value
     }
 
     private func setMeta(_ key: String, _ value: Int64) throws {
-        let statement = try database.prepare(
+        let statement = try database.cachedStatement(
             "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
         statement.bind(1, key).bind(2, value)
         try statement.run()
@@ -213,7 +218,7 @@ public final class HistoryStore {
     @discardableResult
     public func register(_ sensor: SensorDescriptor) throws -> Int64 {
         if let id = sensorIDs[sensor.key] { return id }
-        let insert = try database.prepare("""
+        let insert = try database.cachedStatement("""
             INSERT INTO sensors(key, name, kind, sensor_group) VALUES(?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET name = excluded.name,
                                            kind = excluded.kind,
@@ -223,12 +228,13 @@ public final class HistoryStore {
               .bind(3, sensor.kind.rawValue).bind(4, sensor.group)
         try insert.run()
 
-        let lookup = try database.prepare("SELECT id FROM sensors WHERE key = ?")
+        let lookup = try database.cachedStatement("SELECT id FROM sensors WHERE key = ?")
         lookup.bind(1, sensor.key)
         guard try lookup.step() else {
             throw HistoryError.sqlite("sensor \(sensor.key) vanished after insert")
         }
         let id = lookup.int64(0)
+        try lookup.drain()
         sensorIDs[sensor.key] = id
         return id
     }
@@ -245,7 +251,7 @@ public final class HistoryStore {
         guard !batches.isEmpty else { return }
         var oldest = Int64.max
         try database.transaction {
-            let insert = try database.prepare(
+            let insert = try database.cachedStatement(
                 "INSERT OR REPLACE INTO samples(sensor_id, ts, value) VALUES(?, ?, ?)")
             for batch in batches {
                 let ts = Int64(batch.date.timeIntervalSince1970.rounded())
@@ -320,7 +326,7 @@ public final class HistoryStore {
 
         let columns = source.columns
         try database.transaction {
-            let statement = try database.prepare("""
+            let statement = try database.cachedStatement("""
                 INSERT OR REPLACE INTO \(destination.table)(sensor_id, ts, avg_value, min_value, max_value)
                 SELECT sensor_id, (ts / \(bucket)) * \(bucket),
                        avg(\(columns.average)), min(\(columns.minimum)), max(\(columns.maximum))
@@ -362,7 +368,7 @@ public final class HistoryStore {
 
         try database.transaction {
             for (table, cutoff) in cutoffs {
-                let statement = try database.prepare("DELETE FROM \(table) WHERE ts < ?")
+                let statement = try database.cachedStatement("DELETE FROM \(table) WHERE ts < ?")
                 statement.bind(1, cutoff)
                 try statement.run()
             }
@@ -370,7 +376,7 @@ public final class HistoryStore {
             // `ended_at IS NOT NULL`: a record still open is the record of
             // something that has not finished, whatever its age says.
             for table in ["episodes", "spikes", "sessions"] {
-                let statement = try database.prepare(
+                let statement = try database.cachedStatement(
                     "DELETE FROM \(table) WHERE started_at < ? AND ended_at IS NOT NULL")
                 statement.bind(1, eventCutoff)
                 try statement.run()
@@ -381,7 +387,7 @@ public final class HistoryStore {
             // last row is what says which profile has been active ever since.
             // Ageing it out would leave the chart's first band unlabelled and
             // make the recorder write a duplicate transition on next launch.
-            let changes = try database.prepare("""
+            let changes = try database.cachedStatement("""
                 DELETE FROM profile_changes
                 WHERE ts < ? AND ts < (SELECT max(ts) FROM profile_changes)
                 """)
@@ -395,7 +401,7 @@ public final class HistoryStore {
     func pruneForTesting(now: Date) throws { try prune(now: now) }
 
     func rowCountForTesting(_ table: String) throws -> Int {
-        let statement = try database.prepare("SELECT count(*) FROM \(table)")
+        let statement = try database.cachedStatement("SELECT count(*) FROM \(table)")
         guard try statement.step() else { return 0 }
         return Int(statement.int64(0))
     }
@@ -404,6 +410,15 @@ public final class HistoryStore {
     /// assert on instead of elapsed seconds: a plan that turned quadratic shows
     /// up here identically on a loaded machine and an idle one.
     var workUnitsForTesting: Int { database.workUnits }
+
+    /// SQLite's own statistics-driven tune-up: creates or drops indexes it has
+    /// evidence the query mix wants. Cheap when there is nothing to do, which is
+    /// why this runs at quit rather than never — the schema is fixed, so today
+    /// it will usually be a no-op, but the analysis data it keeps makes any
+    /// future query-shape change self-correcting instead of a migration.
+    public func optimize() {
+        try? database.execute("PRAGMA optimize")
+    }
 
     /// Makes every write fail, the way a full disk or a read-only volume does.
     ///
@@ -489,6 +504,9 @@ public final class HistoryStore {
         let columns = tier.columns
         let placeholders = keys.map { _ in "?" }.joined(separator: ",")
 
+        // Dynamic SQL — the bucket width and placeholder count vary with the
+        // window and selection — so this stays on `prepare`: putting it through
+        // the cache would grow the cache with every distinct view.
         let statement = try database.prepare("""
             SELECT s.key, s.name, s.kind,
                    (t.ts / \(bucket)) * \(bucket) AS bucket,
@@ -525,6 +543,7 @@ public final class HistoryStore {
         let columns = tier.columns
         let placeholders = groups.map { _ in "?" }.joined(separator: ",")
 
+        // Dynamic SQL, same rule as `series` above.
         let statement = try database.prepare("""
             SELECT sensor_group, sensor_group, min(kind), bucket,
                    avg(hottest_avg), min(hottest_min), max(hottest_max)
@@ -578,7 +597,7 @@ public final class HistoryStore {
 
     /// Every sensor ever recorded, for the export column list and the picker.
     public func knownSensors() throws -> [SensorDescriptor] {
-        let statement = try database.prepare(
+        let statement = try database.cachedStatement(
             "SELECT key, name, kind, sensor_group FROM sensors ORDER BY sensor_group, name")
         var result: [SensorDescriptor] = []
         while try statement.step() {
@@ -593,7 +612,7 @@ public final class HistoryStore {
     /// Groups that actually have data, so the chart never offers a toggle that
     /// would draw nothing.
     public func knownGroups() throws -> [String] {
-        let statement = try database.prepare(
+        let statement = try database.cachedStatement(
             "SELECT DISTINCT sensor_group FROM sensors ORDER BY sensor_group")
         var result: [String] = []
         while try statement.step() { result.append(statement.string(0)) }
@@ -616,7 +635,7 @@ public final class HistoryStore {
         let processes = try Self.jsonEncoder.encode(episode.processes)
 
         if episode.id != 0 {
-            let update = try database.prepare("""
+            let update = try database.cachedStatement("""
                 UPDATE episodes SET ended_at = ?, peak_temp = ?, peak_pressure = ?, mean_cpu = ?,
                                     profile_name = ?, on_battery = ?, external_displays = ?,
                                     fan_rpm_at_peak = ?, processes = ?
@@ -636,7 +655,7 @@ public final class HistoryStore {
             return episode.id
         }
 
-        let insert = try database.prepare("""
+        let insert = try database.cachedStatement("""
             INSERT INTO episodes(started_at, ended_at, peak_temp, peak_pressure, mean_cpu,
                                  profile_name, on_battery, external_displays,
                                  fan_rpm_at_peak, processes)
@@ -659,7 +678,7 @@ public final class HistoryStore {
     /// Episodes overlapping the window — one that started before `from` and is
     /// still running belongs on the chart.
     public func episodes(from: Date, to: Date) throws -> [ThrottleEpisode] {
-        let statement = try database.prepare("""
+        let statement = try database.cachedStatement("""
             SELECT id, started_at, ended_at, peak_temp, peak_pressure, mean_cpu,
                    profile_name, on_battery, external_displays, fan_rpm_at_peak, processes
             FROM episodes
@@ -703,7 +722,7 @@ public final class HistoryStore {
         let processes = try Self.jsonEncoder.encode(spike.processes)
 
         if spike.id != 0 {
-            let update = try database.prepare("""
+            let update = try database.cachedStatement("""
                 UPDATE spikes SET peaked_at = ?, ended_at = ?, from_temp = ?, peak_temp = ?,
                                   cpu_at_start = ?, peak_cpu = ?, hottest_group = ?,
                                   peak_fan_rpm = ?, peak_fan_duty = ?, profile_name = ?,
@@ -730,7 +749,7 @@ public final class HistoryStore {
             return spike.id
         }
 
-        let insert = try database.prepare("""
+        let insert = try database.cachedStatement("""
             INSERT INTO spikes(started_at, peaked_at, ended_at, from_temp, peak_temp,
                                cpu_at_start, peak_cpu, hottest_group, peak_fan_rpm,
                                peak_fan_duty, profile_name, profile_changed, on_battery,
@@ -759,7 +778,7 @@ public final class HistoryStore {
     /// Spikes overlapping the window, newest first — the same containment rule
     /// as episodes, so one still in progress belongs to every window it reaches.
     public func spikes(from: Date, to: Date, limit: Int = 200) throws -> [Spike] {
-        let statement = try database.prepare("""
+        let statement = try database.cachedStatement("""
             SELECT id, started_at, peaked_at, ended_at, from_temp, peak_temp,
                    cpu_at_start, peak_cpu, hottest_group, peak_fan_rpm, peak_fan_duty,
                    profile_name, profile_changed, on_battery, recorded_names, processes
@@ -815,7 +834,7 @@ public final class HistoryStore {
 
     /// `table` is a literal this file supplies, never anything from outside.
     private func eraseProcessNames(table: String, id: Int64) throws {
-        let statement = try database.prepare("UPDATE \(table) SET processes = '[]' WHERE id = ?")
+        let statement = try database.cachedStatement("UPDATE \(table) SET processes = '[]' WHERE id = ?")
         statement.bind(1, id)
         try statement.run()
     }
@@ -825,7 +844,7 @@ public final class HistoryStore {
     @discardableResult
     public func save(_ session: RecordingSession) throws -> Int64 {
         if session.id != 0 {
-            let update = try database.prepare(
+            let update = try database.cachedStatement(
                 "UPDATE sessions SET name = ?, ended_at = ?, profile_name = ? WHERE id = ?")
             update.bind(1, session.name)
                   .bind(2, session.end.map { Int64($0.timeIntervalSince1970) })
@@ -834,7 +853,7 @@ public final class HistoryStore {
             try update.run()
             return session.id
         }
-        let insert = try database.prepare(
+        let insert = try database.cachedStatement(
             "INSERT INTO sessions(name, started_at, ended_at, profile_name) VALUES(?, ?, ?, ?)")
         insert.bind(1, session.name)
               .bind(2, Int64(session.start.timeIntervalSince1970))
@@ -845,7 +864,7 @@ public final class HistoryStore {
     }
 
     public func sessions(from: Date, to: Date) throws -> [RecordingSession] {
-        let statement = try database.prepare("""
+        let statement = try database.cachedStatement("""
             SELECT id, name, started_at, ended_at, profile_name FROM sessions
             WHERE started_at < ? AND (ended_at IS NULL OR ended_at >= ?)
             ORDER BY started_at DESC
@@ -868,7 +887,7 @@ public final class HistoryStore {
     // MARK: - Profile changes
 
     public func record(_ change: ProfileChange) throws {
-        let statement = try database.prepare("""
+        let statement = try database.cachedStatement("""
             INSERT OR REPLACE INTO profile_changes(ts, profile_id, profile_name, reason)
             VALUES(?, ?, ?, ?)
             """)
@@ -886,7 +905,7 @@ public final class HistoryStore {
         // the window edge when there isn't. (A `UNION ALL` of two ordered,
         // limited selects would read more naturally, but SQLite rejects ORDER BY
         // inside a compound branch.)
-        let statement = try database.prepare("""
+        let statement = try database.cachedStatement("""
             SELECT ts, profile_id, profile_name, reason FROM profile_changes
             WHERE ts < ?
               AND ts >= coalesce((SELECT max(ts) FROM profile_changes WHERE ts < ?), ?)
@@ -909,13 +928,15 @@ public final class HistoryStore {
     /// The most recently recorded profile, so the recorder doesn't write a
     /// duplicate row on every launch.
     public func lastProfileChange() throws -> ProfileChange? {
-        let statement = try database.prepare(
+        let statement = try database.cachedStatement(
             "SELECT ts, profile_id, profile_name, reason FROM profile_changes ORDER BY ts DESC LIMIT 1")
         guard try statement.step() else { return nil }
-        return ProfileChange(date: Date(timeIntervalSince1970: Double(statement.int64(0))),
-                             profileID: statement.string(1),
-                             profileName: statement.string(2),
-                             reason: statement.string(3))
+        let change = ProfileChange(date: Date(timeIntervalSince1970: Double(statement.int64(0))),
+                                   profileID: statement.string(1),
+                                   profileName: statement.string(2),
+                                   reason: statement.string(3))
+        try statement.drain()
+        return change
     }
 
     // MARK: - Recovery
@@ -939,13 +960,13 @@ public final class HistoryStore {
         try database.transaction {
             // `max(started_at, ?)` because a zero-length record is honest and a
             // negative-length one is a bug someone would have to debug later.
-            let episodes = try database.prepare(
+            let episodes = try database.cachedStatement(
                 "UPDATE episodes SET ended_at = max(started_at, ?) WHERE ended_at IS NULL")
             episodes.bind(1, observedUntil)
             try episodes.run()
             closedEpisodes = database.changes
 
-            let sessions = try database.prepare(
+            let sessions = try database.cachedStatement(
                 "UPDATE sessions SET ended_at = max(started_at, ?) WHERE ended_at IS NULL")
             sessions.bind(1, observedUntil)
             try sessions.run()
@@ -955,7 +976,7 @@ public final class HistoryStore {
             // or after its start, so this is the bound that keeps end ≥ peak ≥
             // start — a record whose peak sits outside its own span would break
             // every rate this app computes from it.
-            let spikes = try database.prepare(
+            let spikes = try database.cachedStatement(
                 "UPDATE spikes SET ended_at = max(peaked_at, ?) WHERE ended_at IS NULL")
             spikes.bind(1, observedUntil)
             try spikes.run()
@@ -986,7 +1007,7 @@ public final class HistoryStore {
     /// One query shape for both ends. `aggregate` is a literal this file
     /// supplies, never anything that reached it from outside.
     private func extremeSample(_ aggregate: String) throws -> Date? {
-        let statement = try database.prepare("""
+        let statement = try database.cachedStatement("""
             SELECT \(aggregate)(ts) FROM (
                 SELECT \(aggregate)(ts) AS ts FROM samples_hour
                 UNION ALL SELECT \(aggregate)(ts) FROM samples_minute
@@ -994,7 +1015,9 @@ public final class HistoryStore {
             )
             """)
         guard try statement.step(), !statement.isNull(0) else { return nil }
-        return Date(timeIntervalSince1970: Double(statement.int64(0)))
+        let seconds = statement.int64(0)
+        try statement.drain()
+        return Date(timeIntervalSince1970: Double(seconds))
     }
 
     /// Everything, including the sensor list — a "clear history" that left the
@@ -1007,6 +1030,9 @@ public final class HistoryStore {
             }
         }
         sensorIDs.removeAll()
+        // VACUUM refuses to run while any statement holds an open cursor; the
+        // cache outlives this call, so it is wound down explicitly first.
+        database.quiesceCachedStatements()
         // Outside the transaction: VACUUM cannot run inside one.
         try database.execute("VACUUM")
     }

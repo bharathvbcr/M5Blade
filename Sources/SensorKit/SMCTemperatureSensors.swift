@@ -27,14 +27,39 @@ public actor SMCTemperatureSensors {
         let name: String
     }
 
-    private let connection: SMCConnection
+    /// The slice of the SMC this source needs. `SMCConnection` conforms; the
+    /// seam exists so a transient first-poll failure — the IOKit handle refusing
+    /// to open while another client holds it — can be reproduced in tests
+    /// without hardware, because that failure used to be cached forever (the
+    /// same lesson the app learned in I-7: an untestable dependency is where
+    /// defects hide).
+    public protocol SMCKeySpace: Actor {
+        func open() throws
+        func close()
+        func allKeys() throws -> [SMCKey]
+        func keyInfo(_ key: SMCKey) throws -> SMCKeyInfo
+        func read(_ key: SMCKey) throws -> SMCValue
+    }
+
+    /// How long to wait before retrying discovery after a failed attempt. The
+    /// key space is fixed for the life of the machine, but *this process's view*
+    /// of it is not — a busy user client or a VM's virtual SMC can refuse the
+    /// first open and answer the next one. Retrying every poll would hammer a
+    /// failing service once a second forever; five seconds bounds that while a
+    /// real source still comes back within one watching-cadence tick.
+    public static let failedDiscoveryRetryInterval: TimeInterval = 5
+
+    private let connection: any SMCKeySpace
     private var catalog: [Candidate]?
+    /// When discovery last failed. Non-nil only after a failure, and cleared on
+    /// success — it gates retries, never results.
+    private var lastDiscoveryFailure: ContinuousClock.Instant?
 
     /// Whether discovery has run and found anything. False until the first
-    /// `readAll()`, so callers should treat it as "nothing yet", not "no SMC".
+    /// successful `readAll()`, so callers should treat it as "nothing yet", not "no SMC".
     public private(set) var isAvailable = false
 
-    public init(connection: SMCConnection = SMCConnection()) {
+    public init(connection: some SMCKeySpace = SMCConnection()) {
         self.connection = connection
     }
 
@@ -55,15 +80,25 @@ public actor SMCTemperatureSensors {
     private func discover() async -> [Candidate] {
         if let catalog { return catalog }
 
+        // A transient failure must not be mistaken for an answer. The empty
+        // catalog this used to latch on a failed `open()` silenced the entire
+        // SMC source until relaunch — one bad first poll, permanently applied.
+        // Failures now leave the catalog unset and back the retry off.
+        if let lastFailure = lastDiscoveryFailure,
+           ContinuousClock().now < lastFailure
+               .advanced(by: .seconds(Self.failedDiscoveryRetryInterval)) {
+            return []
+        }
+
         do {
             try await connection.open()
         } catch {
-            catalog = []
+            lastDiscoveryFailure = ContinuousClock().now
             return []
         }
 
         guard let keys = try? await connection.allKeys() else {
-            catalog = []
+            lastDiscoveryFailure = ContinuousClock().now
             return []
         }
 
@@ -80,6 +115,7 @@ public actor SMCTemperatureSensors {
         }
 
         catalog = found
+        lastDiscoveryFailure = nil
         isAvailable = !found.isEmpty
         return found
     }
@@ -115,4 +151,14 @@ public actor SMCTemperatureSensors {
     public func close() async {
         await connection.close()
     }
+
+    /// Test hook: the retry cooldown is wall-clock, so a suite that wants to
+    /// exercise recovery without sleeping out five seconds clears it instead.
+    func expireDiscoveryCooldownForTesting() {
+        lastDiscoveryFailure = nil
+    }
 }
+
+/// The real connection already has exactly this surface; stating it here keeps
+/// SMCKit free of any knowledge of this source.
+extension SMCConnection: SMCTemperatureSensors.SMCKeySpace {}

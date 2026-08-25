@@ -127,12 +127,20 @@ public struct ConfigStore: Sendable {
         self.url = url
     }
 
-    /// `~/Library/Application Support/FanControl/config.json`
+    /// `~/Library/Application Support/M5Blade/config.json`
     public static func defaultURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        return base.appendingPathComponent("FanControl/config.json")
+        let targetURL = base.appendingPathComponent("M5Blade/config.json")
+        let legacyURL = base.appendingPathComponent("FanControl/config.json")
+        if !FileManager.default.fileExists(atPath: targetURL.path),
+           FileManager.default.fileExists(atPath: legacyURL.path) {
+            try? FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: legacyURL, to: targetURL)
+        }
+        return targetURL
     }
 
     public static func `default`() -> ConfigStore { ConfigStore(url: defaultURL()) }
@@ -141,6 +149,16 @@ public struct ConfigStore: Sendable {
         let e = JSONEncoder()
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         return e
+    }
+
+    /// The canonical encodings, exposed so export and import produce exactly
+    /// what the store writes on disk — one shape, not two near-identical ones.
+    public static func encode(_ configuration: Configuration) throws -> Data {
+        try encoder.encode(configuration)
+    }
+
+    public static func decode(_ data: Data) throws -> Configuration {
+        try JSONDecoder().decode(Configuration.self, from: data)
     }
 
     /// Returns nil when no config has been written yet — a first run, not an error.
@@ -173,11 +191,53 @@ public struct ConfigStore: Sendable {
         }
     }
 
+    /// How many known-good configs to keep behind the live one. A bad hand-edit
+    /// or a future migration used to have exactly one predecessor — the file
+    /// being overwritten right now — and one wrong save destroyed it. Three
+    /// covers "save, notice, save again" without growing with usage.
+    public static let backupCount = 3
+
     public func save(_ configuration: Configuration) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
+        rollBackups()
         let data = try Self.encoder.encode(configuration)
         try data.write(to: url, options: .atomic)
+    }
+
+    /// Copies the config about to be overwritten into a timestamped backup,
+    /// pruning the oldest so the set stays bounded.
+    ///
+    /// The copy is made *before* the new write, and only of what exists — so a
+    /// first-ever save creates no empty backup, and every backup is a
+    /// configuration the app actually loaded and ran on. Failures here are
+    /// swallowed deliberately (`try?`): an unwritable backup must not prevent
+    /// the real save, which is the difference between degraded recovery and no
+    /// working configuration at all.
+    private func rollBackups() {
+        let directory = url.deletingLastPathComponent()
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        pruneBackups(keeping: Self.backupCount - 1)
+        // Milliseconds, not seconds: two saves inside one second must not fight
+        // over one filename, or one of them silently loses its backup.
+        let stamp = Int(Date().timeIntervalSince1970 * 1000)
+        let destination = directory.appendingPathComponent("config.backup-\(stamp).json")
+        try? FileManager.default.copyItem(at: url, to: destination)
+    }
+
+    /// Deletes the oldest `config.backup-*.json` entries beyond `keeping`.
+    private func pruneBackups(keeping: Int) {
+        let directory = url.deletingLastPathComponent()
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        else { return }
+        // Lexicographic order is chronological here: the stamp is fixed-width
+        // milliseconds, so "10" never sorts above "9".
+        let backups = entries
+            .filter { $0.hasPrefix("config.backup-") && $0.hasSuffix(".json") }
+            .sorted()
+        for name in backups.dropLast(max(0, keeping)) {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
     }
 
     /// Load, falling back to factory defaults on any failure. The reason is

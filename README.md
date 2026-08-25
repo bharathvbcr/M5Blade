@@ -1,4 +1,4 @@
-# Fan_Control
+# M5Blade
 
 A native Swift fan controller and system monitor for Apple Silicon Macs.
 
@@ -11,7 +11,7 @@ Design docs: [`FEASIBILITY.md`](FEASIBILITY.md) · [`AUDIT.md`](AUDIT.md) · [`D
 
 ## Status: Tested & Verified
 
-The codebase is compiled, verified, and backed by a comprehensive test suite of 553 pure-logic and app unit tests (0 failures). Tested on Apple Silicon Macs (including M5 Pro on macOS 27.0).
+The codebase is compiled, verified, and backed by a comprehensive test suite of 704 pure-logic and app unit tests (0 failures). Tested on Apple Silicon Macs (including M5 Pro on macOS 27.0).
 
 Verified subsystems and safety guarantees:
 
@@ -29,7 +29,7 @@ Verified subsystems and safety guarantees:
 ## Build and probe — start here
 
 ```bash
-make test     # pure-logic & system unit tests (553 tests, 0 failures)
+make test     # pure-logic & system unit tests (704 tests, 0 failures)
 make probe    # read-only hardware probe
 ```
 
@@ -48,17 +48,23 @@ Generation : M5-style — easiest case, no unlock needed
 ## Enable fan control
 
 ```bash
-make app       # assemble and ad-hoc sign FanControl.app
+make app       # assemble and ad-hoc sign M5Blade.app
 make install   # installs the root helper — asks for sudo
 ```
 
-`install-helper.sh` derives your app's cdhash and pins the helper's XPC listener to it. **Rebuilding the app changes the cdhash — re-run `make install`.** A helper with no requirement file refuses every connection by design.
+`install-helper.sh` derives your app's cdhash and pins the helper's XPC listener to it. **Rebuilding the app changes the cdhash — re-run `make install`.** A helper with no requirement file refuses every connection by design. `smcfan status` reports exactly that state: installed, running, which cdhash is pinned, and whether the bundle you are looking at matches the pin.
 
-Then open `Products/FanControl.app` and use the menu bar item.
+The first time you take control — a profile click, the auto toggle, or *Enable* — the app asks once, in plain language, what that means. Answering persists per machine.
+
+Then open `Products/M5Blade.app` and use the menu bar item.
 
 ## Menu bar
 
-The status item shows a live temperature and rpm readout. **Left-click** opens the panel; **right-click** opens the control menu:
+The status item shows a live temperature and rpm readout — or less of it, if you
+ask: Settings › General › *Readout* offers temperature-only and icon-only
+formats for Macs whose menu bar clips behind the notch (macOS gives no way to
+detect the clipping, so the width is yours to spend). **Left-click** opens the
+panel; **right-click** opens the control menu:
 
 | Item | |
 |---|---|
@@ -73,6 +79,8 @@ The status item shows a live temperature and rpm readout. **Left-click** opens t
 
 Two windows, split by what you do in them: **Dashboard** is read-only, **Settings** is where things change.
 
+The panel's system row also reports what the machine can still absorb: **available memory** (the complement of the used figure above it) and **free disk space** on the startup volume, each on Finder's own "available" basis — disk counts purgeable caches the way Finder does, so it agrees with every other number the Mac shows.
+
 The app icon is generated from code by `Scripts/make-icon.swift`; run `make icon` to regenerate `Resources/AppIcon.icns` after editing it. `make app` does this automatically when the script changes.
 
 ## Auto mode
@@ -82,6 +90,8 @@ The menu bar's **Automatic — macOS Controls Fans** item (`a`) is the master sw
 - **On** — macOS owns the fans; this app only watches. This is the default and the safe state, so turning it on always succeeds and takes effect immediately.
 - **Off** — this app drives the fans from the active profile. Requires the privileged helper, and reports why if it can't.
 
+While watching you can choose how hard the sampling tick works: *Full detail* samples every 5 seconds (the historical behaviour); *Battery saver* drops to 15 seconds. Control is always 1 Hz the moment this app takes over; the trade is that history recorded while watching is coarser, which the toggle says outright.
+
 The safety floor, thermal-pressure floor, and emergency release all remain in force whenever auto mode is off.
 
 ## Startup
@@ -90,11 +100,11 @@ Settings › General › **Open Fan Control at login** (`SMAppService`, per UI.m
 
 ## Profiles, curves, and automation
 
-**Settings** (menu bar → *Settings…*, or `,`) has four tabs: General, Profiles, Curves, and Automation.
+**Settings** (menu bar → *Settings…*, or `,`) has four tabs: General, Profiles, Curves, and Automation. General also carries the menu-bar readout format, the watching sampling rate, and **Copy Diagnostics** — one button that puts the app's status, fans, problems, recent control-state transitions, and platform details on the clipboard as pasteable text.
 
 **Profiles** — a profile is a set of per-fan curves plus a ceiling and the responsiveness settings (hysteresis, ramp up/down, smoothing). The five built-ins are editable but not deletable; every fallback path resolves to one, and the panic path resolves to Stock. Add your own with `+`, or duplicate a built-in as a starting point. *Make Default* sets the profile used when no rule matches.
 
-**Curves** — drag a point to move it, click empty space to add one, *Remove Point* to delete. The shaded red band is the safety floor: points are clamped out of it during the drag, so an unsafe curve cannot be authored at all. The dashed orange line is the profile's ceiling; the green line is the current temperature. Nothing reaches the fans until *Apply*.
+**Curves** — three ways to edit the same draft. Drag a handle to move it (⇧ locks the drag vertical, with the pre-grab curve ghosted behind the live one), click empty space to add one, *Remove Point* to delete. Tab walks the handles and the arrow keys nudge the selected point (Option for fine steps; Delete removes it); below the graph, every point is an editable numeric row for precise values. All three paths go through one clamp — out of the shaded red floor band, under the ceiling, past no neighbour — so an unsafe curve cannot be authored by *any* of them. Every edit is undoable with ⌘Z. The dashed orange line is the profile's ceiling; the green line is the current temperature. Nothing reaches the fans until *Apply*.
 
 **Automation** — rules switch profiles for you. Conditions available:
 
@@ -118,7 +128,9 @@ Menu bar → *Dashboard…* (`d`). Three pages over one set of data.
 
 **Insights** — why it got hot. Leads with what the machine is doing right now, then lists the sudden rises it has recorded, each with a named cause and the measurements that cause was inferred from. *Show on chart* scrubs the History page to that moment, which is the reason these are one window rather than three.
 
-**Sensors** — every temperature sensor the machine exposes, grouped by subsystem (CPU, GPU, SoC, Memory, Storage, Battery, Power, Display, Ambient, Other) with a live Swift Charts plot per group. Expand a group for per-sensor rows and an explanation of what it covers.
+**Sensors** — every temperature sensor the machine exposes, grouped by subsystem (CPU, GPU, SoC, Memory, Storage, Battery, Power, Display, Ambient, Other) with a live Swift Charts plot per group. Expand a group for per-sensor rows and an explanation of what it covers. Both the History and Sensors plots expose full audio-graph descriptors, so VoiceOver's Chart Detail can walk them series by series rather than reading only a summary.
+
+A fan reading that stops arriving does not masquerade as live: after ten seconds without a fresh sample the popover marks it **stale**, and the diagnostics report carries the same judgement.
 
 **History** — the recorded chart, throttle episodes, sessions, and export.
 
@@ -132,7 +144,7 @@ Two things worth knowing about Apple Silicon sensors:
 Two separate things, deliberately:
 
 - `LiveWindow` is a rolling 15-minute in-memory tier, forgotten on quit, behind the popover sparklines and the Sensors page plots. A popover should never wait on a database.
-- `HistoryStore` persists to `~/Library/Application Support/FanControl/history.sqlite` and backs the History page. Three tiers, each a downsample of the one before: raw seconds for 2 hours, minute aggregates for 14 days, hour aggregates for 2 years. Rollup is watermarked, so it costs the same whether the database is a day or a year old. The History page shows the size and can clear it.
+- `HistoryStore` persists to `~/Library/Application Support/M5Blade/history.sqlite` and backs the History page. Three tiers, each a downsample of the one before: raw seconds for 2 hours, minute aggregates for 14 days, hour aggregates for 2 years. Rollup is watermarked, so it costs the same whether the database is a day or a year old. The History page shows the size and can clear it.
 
 Both tiers live in `HistoryKit`, are written from the same batch each tick, and share one key space — so a series drawn live and the same series read back from disk are the same series, not two things that happen to look alike.
 
@@ -184,7 +196,7 @@ The dashboard previously showed the control percent, so a fan spinning at 1357 r
 
 ### Where it's stored
 
-`~/Library/Application Support/FanControl/config.json`, written atomically on every edit. If it can't be parsed it is moved aside as `config.invalid-*.json` rather than deleted, defaults are loaded, and the reason is shown in Settings.
+`~/Library/Application Support/M5Blade/config.json`, written atomically on every edit. The last three good versions are kept beside it as `config.backup-*.json`, and Settings › General can **Export…**/**Import…** the whole document — import reconciles against this machine's fan count and reports what it corrected. If the live file can't be parsed it is moved aside as `config.invalid-*.json` rather than deleted, defaults are loaded, and the reason is shown in Settings.
 
 ## Undo
 
@@ -197,9 +209,11 @@ sudo .build/release/smcfan auto    # immediate release, no uninstall
 
 ```
 smcfan probe            Verify hardware support (read-only)
+smcfan status           Helper: installed, pinned cdhash, running, log tail
 smcfan fans             Fan rpm, target, mode
 smcfan sensors          Temperature sensors
 smcfan keys F0          Dump SMC keys with types and permissions
+smcfan power            CPU/GPU package watts via IOReport
 smcfan watch 60         Live readout
 smcfan set 0 3000       Set fan 0 target        (root)
 smcfan auto             Release all fans        (root)
@@ -216,47 +230,49 @@ smcfan auto             Release all fans        (root)
 | Emergency release | `.critical` or >100 °C releases the ceiling to 100% |
 | Stale sensors | No valid reading for 10s → release to system mode |
 | Daemon-side clamp | Helper re-clamps every request; assumes the app is compromised |
-| Watchdog | Two missed heartbeats (12s) → helper releases all fans |
+| Watchdog | No beat or arm for >12 s → helper releases all fans; measured step-safe, so a backwards clock correction cannot pin fans |
 | Signals | SIGTERM/SIGINT/SIGHUP → release before exit |
 | Sleep | Fans released before sleep, re-probed on wake |
 | Quit | Sampler stopped and in-flight work superseded before the release |
 | Transition exclusion | `ControlGate` — one fan-control operation at a time; a user action supersedes an in-flight tick (`ISSUES.md` I-3) |
 | Curve editor | Points are geometrically clamped out of the floor region |
 
-The curve ceiling defaults to **95%**, released to 100% only in an emergency.
+The curve ceiling defaults to **95%**, released to 100% only in an emergency. Losing an armed helper and the emergency-release path each raise one rate-limited notification — the two states where the app stopped doing what it said, which otherwise showed only as a glyph change behind a closed popover.
 
 ## Layout
 
 ```
 Sources/
   SMCKit/        IOKit transport — actor-serialized, no IOKit call outside it
+  CIOReport/     C shim over libIOReport — Energy Model power counters
   FanKit/        Curves, safety floor, control loop, SMC + simulated backends
+  PowerKit/      Battery health, power source, charge limit
   ProfileKit/    Profiles, rules, pure precedence resolver
   SensorKit/     HID temps, host metrics, process metrics, thermal state
   HistoryKit/    SQLite time series, retention tiers, throttle detection, export
   DaemonProtocol/ Shared XPC interface — deliberately minimal
   DaemonCore/    Daemon policy, write-only validation, hard floor & watchdog logic
   SimSupport/    Test-only thermal simulator, seeded trace generators, invariant checkers
-  fancontrold/   Root LaunchDaemon
+  m5bladed/      Root LaunchDaemon
   smcfan/        Read-only probe CLI
-  FanControl/    NSStatusItem app, popover, curve editor, history window,
+  M5Blade/       NSStatusItem app, popover, curve editor, history window,
                  ControlGate — exclusion + supersession for fan-control operations
-Tests/           553 tests across 8 test suites (DaemonCoreTests, DaemonProtocolTests,
-                 FanControlAppTests, FanKitTests, HistoryKitTests, ProfileKitTests,
-                 SensorKitTests, smcfanTests)
+Tests/           704 tests across 9 test targets (DaemonCoreTests, DaemonProtocolTests,
+                 M5BladeAppTests, FanKitTests, HistoryKitTests, PowerKitTests,
+                 ProfileKitTests, SensorKitTests, smcfanTests)
 ```
 
-Memory readouts follow Activity Monitor exactly: `used` is App Memory + Wired + Compressed, rendered in GiB — which is what macOS means by "GB" for memory (`ISSUES.md` I-1 and I-2).
+Memory readouts follow Activity Monitor exactly: `used` is App Memory + Wired + Compressed, rendered in GiB — which is what macOS means by "GB" for memory (`ISSUES.md` I-1 and I-2). `available` is the complement of `used` on the same basis; disk figures keep the opposite, 1e9-based convention via `StorageFormat`, so the two can never swap formatters.
 
 ## Task Roadmap & Future Work
 
-Actionable tasks and open items tracked in [`ISSUES.md`](ISSUES.md):
+Actionable tasks and open items tracked in [`ISSUES.md`](ISSUES.md) — all five are now **done**:
 
-- **T-1 (System / UX)**: Detect concurrent root fan controllers (e.g. Macs Fan Control) and display a warning banner (`ISSUES.md` I-9).
-- **T-2 (SensorKit)**: Remove unreferenced public API `SystemMetrics.swapUsage()` (`ISSUES.md` I-10).
-- **T-3 (Settings / PowerKit)**: Surface Battery Charge Limit (80%/100%) UI controls (`DESIGN.md` §8).
-- **T-4 (Notifications)**: Dispatch UserNotifications on sustained throttle / thermal pressure (`DESIGN.md` §3.4).
-- **T-5 (Dashboard)**: Add CPU/GPU Package Power charting in Swift Charts (`DESIGN.md` §8).
+- **T-1 (System / UX)** ✅: Detect concurrent root fan controllers (e.g. Macs Fan Control) and display a warning banner (`ISSUES.md` I-9).
+- **T-2 (SensorKit)** ✅: Remove unreferenced public API `SystemMetrics.swapUsage()` (`ISSUES.md` I-10).
+- **T-3 (Settings / PowerKit)** ✅: Battery health readout plus charge-limit state; writes go through the daemon behind a disabled-by-default opt-in (`DESIGN.md` §6.3).
+- **T-4 (Notifications)** ✅: UserNotifications on sustained throttle / critical thermal pressure, rate-limited per `DESIGN.md` §3.5.
+- **T-5 (Dashboard)** ✅: CPU/GPU Package Power charting in Swift Charts via IOReport Energy Model counters.
 
 ## Privacy
 

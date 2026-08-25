@@ -129,6 +129,36 @@ final class SystemMetricsTests: XCTestCase {
                           "1e9 is the storage convention and would render 64 GiB as 69 GB")
     }
 
+    /// Storage keeps the opposite convention to memory (I-2): Finder's GB is
+    /// 1e9-based, and reaching for the memory formatter would misrender it.
+    func testStorageIsFormattedWithTheStorageConvention() {
+        let twoHundredGB: UInt64 = 200_000_000_000
+        XCTAssertEqual(StorageFormat.gigabytes(twoHundredGB), 200, accuracy: 0.001)
+        XCTAssertNotEqual(MemoryFormat.gibibytes(twoHundredGB), 200, accuracy: 0.5,
+                          "the memory formatter is the wrong helper for storage")
+    }
+
+    // MARK: - Available
+
+    /// Available is the complement of `used` — free pages and cached files plus
+    /// whatever no category accounts for (firmware-reserved and kin). It is not
+    /// `free + cachedFiles`: the page categories do not sum to physical memory,
+    /// so that identity fails by 4.6 GB on this very fixture.
+    func testAvailableIsTheComplementOfUsed() {
+        let u = usage()
+        XCTAssertEqual(u.available, u.total - u.used)
+        XCTAssertGreaterThan(u.available, u.free + u.cachedFiles,
+                             "unaccounted memory belongs to available, not to used")
+    }
+
+    /// A sample whose categories exceed the total must saturate at zero rather
+    /// than underflow — the same rule every other subtraction here obeys.
+    func testAvailableSaturatesRatherThanUnderflows() {
+        let usage = MemoryUsage(vmStatistics: sample(), pageSize: pageSize, physicalMemory: 1)
+        XCTAssertEqual(usage.pressure, 1)
+        XCTAssertEqual(usage.available, 0)
+    }
+
     // MARK: - Live
 
     /// Whatever this machine is doing, the reading has to be self-consistent.
@@ -152,6 +182,14 @@ final class SystemMetricsTests: XCTestCase {
         XCTAssertEqual(SystemMetrics.pageSize, 16_384)
     }
 
+    /// The startup volume always answers statfs, so nil here means the sampler
+    /// broke — and a zero reading would mean a full disk, not "unknown".
+    func testTheLiveDiskReadingIsPlausible() throws {
+        let bytes = try XCTUnwrap(SystemMetrics().availableDiskSpace(),
+                                  "statfs failed on a volume that is mounted")
+        XCTAssertGreaterThan(bytes, 0)
+    }
+
     // MARK: - CPU
 
     /// The first call has nothing to difference against and must say so rather
@@ -171,11 +209,43 @@ final class SystemMetricsTests: XCTestCase {
         XCTAssertEqual(usage.user + usage.system + usage.idle + usage.nice, 100, accuracy: 0.01,
                        "the four CPU states must partition the interval")
         XCTAssertGreaterThanOrEqual(usage.total, 0)
-        XCTAssertLessThanOrEqual(usage.total, 100)
+        // Same tolerance as the partition above: four rounded percentages can
+        // sum to 100.00000000000001, which is arithmetic drift, not a reading.
+        XCTAssertLessThanOrEqual(usage.total, 100.00001)
         XCTAssertFalse(usage.perCore.isEmpty)
         for core in usage.perCore {
             XCTAssertGreaterThanOrEqual(core, 0)
             XCTAssertLessThanOrEqual(core, 100)
         }
+    }
+
+    // MARK: - Host port
+
+    /// `mach_host_self()` returns a new send right per call. Both polls used to
+    /// call it inline and never deallocate the right — at one call each per
+    /// tick, an app left running for days leaked kernel port rights without
+    /// bound. The port is now acquired once and reused; this pins the "once"
+    /// by counting factory invocations across several polls.
+    func testTheHostPortIsAcquiredOnceNotOncePerPoll() throws {
+        SystemMetrics.resetCachedHostPortForTesting()
+        defer { SystemMetrics.resetCachedHostPortForTesting() }
+        let lock = NSLock()
+        var acquisitions = 0
+        SystemMetrics.hostPortFactory = {
+            lock.lock(); acquisitions += 1; lock.unlock()
+            return mach_host_self()
+        }
+        defer {
+            SystemMetrics.hostPortFactory = { mach_host_self() }
+        }
+
+        let metrics = SystemMetrics()
+        _ = metrics.memoryUsage()
+        _ = metrics.cpuUsage()   // nil on first call: baseline only, still costs a poll
+        _ = metrics.memoryUsage()
+
+        lock.lock(); let count = acquisitions; lock.unlock()
+        XCTAssertEqual(count, 1,
+                       "the host send right must be cached, not allocated per call (\(count) acquisitions)")
     }
 }

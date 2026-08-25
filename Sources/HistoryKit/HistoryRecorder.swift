@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import FanKit
 
 /// Owns the history database and everything that writes to it.
@@ -101,13 +102,73 @@ public actor HistoryRecorder {
         spikeDetector.setRecordsProcessNames(recordsProcessNames)
     }
 
-    /// `~/Library/Application Support/FanControl/history.sqlite` — the same
+    /// `~/Library/Application Support/M5Blade/history.sqlite` — the same
     /// private directory the configuration lives in, never a shared location.
+    ///
+    /// A database left behind by the pre-rename app is migrated once, through
+    /// SQLite's online-backup API rather than a byte copy: a live database's
+    /// newest commits sit in its `-wal` file, and copying the main file plus
+    /// `-wal` with three independent `try?`s could tear — losing recent history,
+    /// or producing a malformed file that then latched "history broken" forever,
+    /// because the gate above never re-runs over an existing target. A failed
+    /// migration now removes its partial output so the next launch retries.
     public static func defaultURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        return base.appendingPathComponent("FanControl/history.sqlite")
+        let targetURL = base.appendingPathComponent("M5Blade/history.sqlite")
+        let legacyURL = base.appendingPathComponent("FanControl/history.sqlite")
+        if !FileManager.default.fileExists(atPath: targetURL.path),
+           FileManager.default.fileExists(atPath: legacyURL.path) {
+            try? FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            if !migrateLegacyDatabase(from: legacyURL, to: targetURL) {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(at: URL(fileURLWithPath:
+                        targetURL.path + suffix))
+                }
+            }
+        }
+        return targetURL
+    }
+
+    /// Copies a possibly-live SQLite database into place as one consistent
+    /// snapshot, `-wal` contents included. Internal and parameterised so tests
+    /// can drive it against temporary directories.
+    static func migrateLegacyDatabase(from legacy: URL, to target: URL) -> Bool {
+        var source: OpaquePointer?
+        guard sqlite3_open_v2(legacy.path, &source, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let source else {
+            sqlite3_close_v2(source)
+            return false
+        }
+        defer { sqlite3_close_v2(source) }
+
+        try? FileManager.default.removeItem(at: target)
+        var destination: OpaquePointer?
+        guard sqlite3_open_v2(target.path, &destination,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+              let destination else {
+            sqlite3_close_v2(destination)
+            return false
+        }
+        defer { sqlite3_close_v2(destination) }
+
+        guard let backup = sqlite3_backup_init(destination, "main", source, "main") else {
+            return false
+        }
+        let stepResult = sqlite3_backup_step(backup, -1)
+        let finishResult = sqlite3_backup_finish(backup)
+        guard stepResult == SQLITE_DONE, finishResult == SQLITE_OK else {
+            // The destination was created by the open above; leaving a
+            // zero-byte or partial file would be mistaken for a completed
+            // migration by the existence gate on the next launch.
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: target.path + "-wal"))
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: target.path + "-shm"))
+            return false
+        }
+        return true
     }
 
     /// Turning attribution off means *forget*, not *stop adding*.
@@ -207,11 +268,15 @@ public actor HistoryRecorder {
     ///   a caller recording samples for their own sake — a test, an import — has
     ///   no thermal context to give, and inventing one would manufacture spikes
     ///   that never happened.
+    /// - Returns: what the throttle detector did with this tick — `.none`, or
+    ///   an episode opening, updating, or closing. The alerting layer (T-4)
+    ///   rides on these transitions; nothing else reads them.
+    @discardableResult
     public func record(samples: [RecordedSample], at date: Date,
                        throttle: ThrottleDetector.Input,
                        spike: SpikeDetector.Input? = nil,
-                       profile: ProfileState? = nil) {
-        guard connected() != nil else { return }
+                       profile: ProfileState? = nil) -> ThrottleDetector.Event {
+        guard connected() != nil else { return .none }
 
         if !samples.isEmpty {
             buffer.append((date: date, samples: samples))
@@ -220,7 +285,8 @@ public actor HistoryRecorder {
 
         var input = throttle
         if !recordsProcessNames { input.processes = [] }
-        handle(detector.update(input))
+        let event = detector.update(input)
+        handle(event)
 
         if var spikeInput = spike {
             if !recordsProcessNames { spikeInput.processes = [] }
@@ -237,6 +303,8 @@ public actor HistoryRecorder {
         if abs(date.timeIntervalSince(lastFlush)) >= Self.flushInterval {
             flush(now: date)
         }
+
+        return event
     }
 
     /// Drops the oldest ticks once the buffer is full, and counts them. A chart
@@ -613,6 +681,12 @@ public actor HistoryRecorder {
 
     public func clear() throws {
         guard let store = connected() else { return }
+        // The fallible part first. Resetting in-memory state before the
+        // database answered used to mean a failed transaction left the store
+        // holding an open episode/session while the recorder had forgotten
+        // their IDs — the next event duplicated rows, and the old ones stayed
+        // "in progress" until the next launch repaired them.
+        try store.clear()
         buffer.removeAll()
         droppedBatches = 0
         openEpisodeID = 0
@@ -627,7 +701,6 @@ public actor HistoryRecorder {
         detector = ThrottleDetector()
         spikeDetector = SpikeDetector()
         spikeDetector.setRecordsProcessNames(recordsProcessNames)
-        try store.clear()
     }
 
     // MARK: - Test hooks
@@ -636,6 +709,13 @@ public actor HistoryRecorder {
     /// `HistoryStore.workUnitsForTesting`. What "this must not become O(n²)" is
     /// asserted against, in place of a stopwatch that measures the machine.
     func workUnitsForTesting() -> Int { connected()?.workUnitsForTesting ?? 0 }
+
+    /// SQLite's statistics-driven tune-up, run on the way out. See
+    /// `HistoryStore.optimize()` for why this exists and why it is allowed to
+    /// be a no-op most of the time.
+    public func optimizeOnClose() {
+        connected()?.optimize()
+    }
 
     /// Makes every write fail, so the recorder's failure paths can be exercised
     /// without arranging a full disk. Reads keep working.

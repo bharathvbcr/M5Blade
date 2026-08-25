@@ -193,6 +193,60 @@ final class DaemonCoreTests: XCTestCase {
         XCTAssertEqual(action, .idle, "there is nothing to release, so there is nothing to panic about")
     }
 
+    /// A clock stepped backwards past the last proof of life used to read as
+    /// "no time has passed": the age went negative, the old signed comparison
+    /// failed open, and fans pinned under a dead client stayed pinned until
+    /// wall time crawled forward past the stamp — hours for a large NTP
+    /// correction. Staleness must be judged by magnitude.
+    func testWatchdogTripsWhenTheClockStepsBackPastTheLastHeartbeat() async {
+        let (core, backend) = await makeCore()
+        _ = await core.setManualMode(fan: 0, enabled: true, now: t0)
+        await core.heartbeat(maxTempC: 70, at: t0)
+
+        let action = await core.watchdogTick(now: t0.addingTimeInterval(-3_600))
+        guard case .released = action else {
+            return XCTFail("a clock stepped far backwards must not pin a dead client's fans, got \(action)")
+        }
+        let mode = await backend.mode(of: 0)
+        XCTAssertEqual(mode?.isUserControlled, false)
+    }
+
+    /// A correction smaller than the grace window is not evidence of death:
+    /// the negative age stays inside the timeout, the fan keeps its grace, and
+    /// the normal aging path takes over once wall time passes the stamp — so
+    /// worst case is one extra period, not forever.
+    func testASmallClockStepBackKeepsTheGraceWindow() async {
+        let (core, _) = await makeCore()
+        _ = await core.setManualMode(fan: 0, enabled: true, now: t0)
+        await core.heartbeat(maxTempC: 70, at: t0)
+
+        // Wall falls 5 s behind the last beat, then resumes forward from there.
+        let steppedBack = await core.watchdogTick(now: t0.addingTimeInterval(-5))
+        XCTAssertEqual(steppedBack, .idle)
+        let resumed = await core.watchdogTick(now: t0.addingTimeInterval(2))
+        XCTAssertEqual(resumed, .idle)
+        let agedOut = await core.watchdogTick(now: t0.addingTimeInterval(15))
+        guard case .released = agedOut else {
+            return XCTFail("grace must still expire once wall time passes the stamp, got \(agedOut)")
+        }
+    }
+
+    /// A live client beating about once a second across a modest backwards
+    /// correction must never lose its fans: each fresh stamp re-anchors the
+    /// clock the timeout runs against.
+    func testALiveClientSurvivesAClockStepBack() async {
+        let (core, _) = await makeCore()
+        _ = await core.setManualMode(fan: 0, enabled: true, now: t0)
+        var now = t0
+        for i in 0..<60 {
+            now = t0.addingTimeInterval(Double(i))
+            if i == 30 { now = now.addingTimeInterval(-20) } // one-off NTP correction
+            await core.heartbeat(maxTempC: 70, at: now)
+            let action = await core.watchdogTick(now: now)
+            XCTAssertEqual(action, .idle, "beat \(i): a live client must not be tripped by a clock step")
+        }
+    }
+
     func testTrippedWatchdogRefusesFurtherTargetsUntilManualModeIsRetaken() async {
         let (core, _) = await makeCore()
         _ = await core.setManualMode(fan: 0, enabled: true, now: t0)
@@ -207,7 +261,11 @@ final class DaemonCoreTests: XCTestCase {
         XCTAssertTrue(allowed.isSuccess, "re-arming manual control is the documented way back")
     }
 
-    func testWatchdogRetriesAFailedReleaseAndThenStops() async {
+    /// The release contract in three phases: a bounded fast retry budget, then
+    /// silence against hardware that is refusing, then one attempt per slow
+    /// interval — because giving up used to mean *forever*, and hardware that
+    /// stops refusing minutes later never saw another attempt.
+    func testWatchdogRetriesAFailedReleaseThenBacksOffToASlowCadence() async {
         let (core, backend) = await makeCore()
         _ = await core.setManualMode(fan: 0, enabled: true, now: t0)
         await core.heartbeat(maxTempC: 70, at: t0)
@@ -215,15 +273,31 @@ final class DaemonCoreTests: XCTestCase {
 
         var attempts = 0
         var gaveUp = false
-        for i in 1...20 {
+        // Phase 1+2: one attempt per second until the fast budget is spent,
+        // then giving-up reports without further writes.
+        for i in 1...10 {
             switch await core.watchdogTick(now: t0.addingTimeInterval(100 + Double(i))) {
             case .releaseIncomplete: attempts += 1
             case .givingUp:          gaveUp = true
             default:                 break
             }
         }
-        XCTAssertEqual(attempts, DaemonConstants.maxReleaseRetries)
-        XCTAssertTrue(gaveUp, "retries are bounded — hammering dead hardware once a second is a spin")
+        XCTAssertEqual(attempts, DaemonConstants.maxReleaseRetries,
+                       "the fast budget bounds how often dead hardware is written")
+        XCTAssertTrue(gaveUp, "the give-up state must be visible, not silent")
+
+        // Still inside the slow window: backed off, no writes.
+        let mid = await core.watchdogTick(now: t0.addingTimeInterval(130))
+        guard case .givingUp = mid else { return XCTFail("expected continued backoff, got \(mid)") }
+
+        // Past the window, with the hardware healed: exactly one more attempt
+        // happens, and it succeeds — recovery stays alive after giving up.
+        await backend.setFaults(SimulatedFanBackend.Faults())
+        let deadline = t0.addingTimeInterval(106 + Double(DaemonConstants.slowReleaseRetryInterval))
+        let late = await core.watchdogTick(now: deadline.addingTimeInterval(1))
+        guard case .released = late else { return XCTFail("expected slow-cadence recovery, got \(late)") }
+        let manual = await core.manualFanIndices()
+        XCTAssertTrue(manual.isEmpty)
     }
 
     func testWatchdogRecoversWhenTheHardwareStartsWorkingAgain() async {

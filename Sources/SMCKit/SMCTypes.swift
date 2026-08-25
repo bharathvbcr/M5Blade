@@ -67,6 +67,12 @@ public struct SMCKeyInfo: Sendable {
     public let dataType: UInt32
     public let attributes: UInt8
 
+    public init(dataSize: UInt32, dataType: UInt32, attributes: UInt8) {
+        self.dataSize = dataSize
+        self.dataType = dataType
+        self.attributes = attributes
+    }
+
     public var type: SMCDataType? { SMCDataType(fourCC: dataType) }
 
     /// Per-key permission bits documented by the VirtualSMC SDK.

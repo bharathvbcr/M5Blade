@@ -1,6 +1,6 @@
-# Fan_Control — Interface Design
+# M5Blade — Interface Design
 
-**Target:** macOS 26 (Tahoe), Apple Silicon M5 · **Frameworks:** AppKit `NSStatusItem` + SwiftUI interiors + Swift Charts
+**Target:** macOS 14+ (designed against macOS 26 Tahoe), Apple Silicon · **Frameworks:** AppKit `NSStatusItem` + SwiftUI interiors + Swift Charts
 Companion to `FEASIBILITY.md`, `AUDIT.md`, `DESIGN.md`.
 
 ---
@@ -34,6 +34,8 @@ Concretely, four rules that override any other design consideration:
 | Onboarding | Sheet sequence | First-run probe → consent → daemon install |
 
 Three windows total (Control, History, Settings), tabbed where related. Not eight separate windows.
+
+**As built:** two windows. **Dashboard** (read-only: Insights, Sensors, History) and **Settings** (everything that changes: General, Profiles, Curves, Automation) — the read/change split replaced the Control/History split. Battery health lives in Settings › General rather than a dedicated tab (DESIGN §6.2's both-figures-together rule is kept). Onboarding collapsed into a first-control consent dialog (`AppDialogs`) plus the helper install flow of §8; the curve editor lives in Settings › Curves as a tab rather than its own window.
 
 ---
 
@@ -279,7 +281,7 @@ Defaulting to monitoring is correct. Most people who install this want to *see* 
 │  can adjust fan speed, and nothing else.                     │
 │                                                              │
 │  ┌────────────────────────────────────────────────┐ [Copy]  │
-│  │ sudo /Applications/FanControl.app/Contents/     │         │
+│  │ sudo /Applications/M5Blade.app/Contents/        │         │
 │  │   Resources/install-helper.sh                   │         │
 │  └────────────────────────────────────────────────┘         │
 │                                                              │
@@ -318,6 +320,8 @@ Only things you *change*. The sensor readout lives on the Dashboard (§7.2).
 - **Advanced** — raw SMC key browser (read-only), key-casing probe result, daemon status and logs, uninstall, "reset everything to defaults"
 
 The safety floor being **read-only by default with a disclosure to edit** is deliberate: it's editable for people who need it, and not something anyone changes by wandering through Settings.
+
+**As built:** four tabs — **General** (login item, readout format, watching sample rate, notifications, diagnostics copy), **Profiles**, **Curves**, and **Automation**, matching DESIGN §2's layered model. The Safety/Advanced items distribute into these: profiles own ceilings and responsiveness; the panic path stays one click away in the menu bar; helper status and uninstall live beside the install flow rather than in a raw-advanced tab.
 
 ---
 

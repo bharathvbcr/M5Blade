@@ -1,18 +1,18 @@
-# Fan_Control — build, bundle, install
+# M5Blade — build, bundle, install
 #
 #   make probe      build + run the read-only hardware probe (start here)
 #   make test       run the test suite (no hardware needed)
 #   make icon       regenerate Resources/AppIcon.icns from Scripts/make-icon.swift
-#   make app        assemble FanControl.app
+#   make app        assemble M5Blade.app
 #   make install    install the privileged helper (asks for sudo)
 #   make uninstall  remove the helper and restore automatic fan control
 
 SWIFT       ?= swift
 CONFIG      ?= release
 BUILD_DIR    = .build/$(CONFIG)
-APP_NAME     = FanControl.app
+APP_NAME     = M5Blade.app
 APP_DIR      = Products/$(APP_NAME)
-BUNDLE_ID    = com.fancontrol.app
+BUNDLE_ID    = com.m5blade.app
 ICON         = Resources/AppIcon.icns
 
 .PHONY: all build test probe icon app install uninstall clean ci\:local ci-local package release verify
@@ -40,12 +40,12 @@ app: build $(ICON)
 	@mkdir -p $(APP_DIR)/Contents/MacOS $(APP_DIR)/Contents/Resources
 	@cp Resources/Info.plist $(APP_DIR)/Contents/Info.plist
 	@cp $(ICON) $(APP_DIR)/Contents/Resources/AppIcon.icns
-	@cp $(BUILD_DIR)/FanControlApp $(APP_DIR)/Contents/MacOS/FanControlApp
-	@cp $(BUILD_DIR)/fancontrold $(APP_DIR)/Contents/Resources/fancontrold
+	@cp $(BUILD_DIR)/M5BladeApp $(APP_DIR)/Contents/MacOS/M5BladeApp
+	@cp $(BUILD_DIR)/m5bladed $(APP_DIR)/Contents/Resources/m5bladed
 	@cp $(BUILD_DIR)/smcfan $(APP_DIR)/Contents/Resources/smcfan
 	@cp Scripts/install-helper.sh $(APP_DIR)/Contents/Resources/install-helper.sh
 	@cp Scripts/uninstall-helper.sh $(APP_DIR)/Contents/Resources/uninstall-helper.sh
-	@cp Resources/com.fancontrol.helper.plist $(APP_DIR)/Contents/Resources/
+	@cp Resources/com.m5blade.helper.plist $(APP_DIR)/Contents/Resources/
 	@chmod +x $(APP_DIR)/Contents/Resources/*.sh
 	@codesign --force --deep --sign - --identifier $(BUNDLE_ID) $(APP_DIR)
 	@echo "Built $(APP_DIR) (ad-hoc signed)"
@@ -57,8 +57,8 @@ release: package
 
 verify: app
 	@codesign --verify --deep --strict $(APP_DIR)
-	@test -f $(APP_DIR)/Contents/MacOS/FanControlApp
-	@test -f $(APP_DIR)/Contents/Resources/fancontrold
+	@test -f $(APP_DIR)/Contents/MacOS/M5BladeApp
+	@test -f $(APP_DIR)/Contents/Resources/m5bladed
 	@test -f $(APP_DIR)/Contents/Resources/smcfan
 	@test -x $(APP_DIR)/Contents/Resources/install-helper.sh
 	@test -x $(APP_DIR)/Contents/Resources/uninstall-helper.sh

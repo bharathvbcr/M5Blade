@@ -68,6 +68,45 @@ final class Database {
         try Statement(database: self, sql: sql)
     }
 
+    /// Prepared statements reused across calls, keyed by their SQL text.
+    ///
+    /// Preparing is parsing, and the fixed-shape queries — the meta reads inside
+    /// every flush transaction, retention pruning once a minute, the episode and
+    /// spike lists behind an open History page — paid it on every call. The
+    /// cache holds only statements whose SQL never varies: callers with dynamic
+    /// text keep using `prepare`, so the map cannot grow with the windows the UI
+    /// asks for.
+    ///
+    /// Safe under concurrency by construction rather than by locking: the
+    /// connection is owned by one actor, which serialises every call. Each
+    /// handout is preceded by `reset()` — bindings cleared, iteration rewound,
+    /// the previous run's bytecode steps folded into the work total — so reuse
+    /// of a possibly-mid-iteration statement is correct without any discipline
+    /// at the call sites. That safety holds only while no caller *steps* one
+    /// cached statement inside another's step loop; none does, and a new one
+    /// would be serialisation bug of its own.
+    private var statementCache: [String: Statement] = [:]
+
+    func cachedStatement(_ sql: String) throws -> Statement {
+        if let cached = statementCache[sql] {
+            cached.reset()
+            return cached
+        }
+        let statement = try Statement(database: self, sql: sql)
+        statementCache[sql] = statement
+        return statement
+    }
+
+    /// Rewinds every cached statement, so nothing is left "in progress".
+    ///
+    /// VACUUM refuses to run while any statement holds an open cursor. The
+    /// single-row readers drain their results precisely so this state never
+    /// arises; this is the backstop that makes `clear()` correct even if a
+    /// future reader forgets.
+    func quiesceCachedStatements() {
+        for statement in statementCache.values { statement.reset() }
+    }
+
     /// IMMEDIATE rather than DEFERRED: the write lock is taken up front, so a
     /// batch insert can't fail halfway through with SQLITE_BUSY.
     func transaction<T>(_ body: () throws -> T) throws -> T {
@@ -129,7 +168,6 @@ final class Statement {
         }
         sqlite3_finalize(statement)
     }
-
     @discardableResult
     func bind(_ index: Int32, _ value: Int64) -> Statement {
         sqlite3_bind_int64(statement, index, value)
@@ -170,15 +208,40 @@ final class Statement {
     }
 
     /// True when a row is available, false at end of results.
+    ///
+    /// Reaching the end resets the statement immediately rather than waiting
+    /// for the next handout: SQLite holds a stepped-but-not-finished statement
+    /// open, and a connection carrying one cannot VACUUM. Cached statements
+    /// used to hit exactly that — a single-row reader that stopped after the
+    /// first row stayed "in progress" forever, and `clear()` failed with
+    /// "cannot VACUUM". Auto-resetting at DONE means any query whose iteration
+    /// runs to completion leaves nothing behind; callers that stop early must
+    /// still drain (the single-row readers here do, and their queries return
+    /// at most one row, so draining costs one step).
     @discardableResult
     func step() throws -> Bool {
         switch sqlite3_step(statement) {
         case SQLITE_ROW:  return true
-        case SQLITE_DONE: return false
+        case SQLITE_DONE:
+            // Total this run's bytecode steps here, at completion, rather than
+            // deferring to the next reset: the O(n²) guards measure deltas
+            // around individual operations, and deferred counting would charge
+            // one operation's work to whichever call reused the statement next.
+            // The status read zeroes the counter, so nothing is counted twice.
+            database.workUnits += Int(sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 1))
+            sqlite3_reset(statement)
+            return false
         default:
             let message = database.handle.map { String(cString: sqlite3_errmsg($0)) } ?? "step failed"
             throw HistoryError.sqlite(message)
         }
+    }
+
+    /// Steps to the end of a result whose rows are no longer needed, so a
+    /// cached statement is left clean instead of busy. Cheap by construction —
+    /// the callers are single-row queries.
+    func drain() throws {
+        while try step() {}
     }
 
     /// Step a statement that returns no rows.
@@ -186,7 +249,18 @@ final class Statement {
         _ = try step()
     }
 
+    /// Readies the statement for another run.
+    ///
+    /// Also where per-run work is totalled for cached statements: they are
+    /// finalised only when the connection closes, so the deinit sweep would
+    /// otherwise report nothing until then and the O(n²) guards would lose
+    /// their signal. The status read uses SQLite's reset-the-counter flag, which
+    /// returns the steps of exactly one run — so a run counted here contributes
+    /// nothing again at finalise.
     func reset() {
+        if let statement {
+            database.workUnits += Int(sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 1))
+        }
         sqlite3_reset(statement)
         sqlite3_clear_bindings(statement)
     }

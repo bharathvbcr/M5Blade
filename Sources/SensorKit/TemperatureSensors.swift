@@ -89,6 +89,32 @@ public final class TemperatureSensors: @unchecked Sendable {
     private var client: AnyObject?
     private let lock = NSLock()
 
+    /// Static per-service metadata, cached between samples.
+    ///
+    /// A service's name and SMC key cannot change while the machine runs —
+    /// they describe which die the sensor sits on — yet the naive path paid for
+    /// two property copies per service on every sample, which at 52 services
+    /// dominated the sampling budget. The event read must still happen each
+    /// sample (that is the measurement); only the identity is remembered.
+    ///
+    /// Keyed on the service reference itself. The hub usually hands back the
+    /// same long-lived objects, so hits are the norm; anything unrecognised is
+    /// simply read the slow way and inserted, which also makes the cache
+    /// self-healing across wake or hot-plug without an explicit invalidation
+    /// hook. Entries no longer seen are dropped, so it cannot grow.
+    private struct ServiceIdentity {
+        let name: String
+        let smcKey: String
+    }
+    private var identities: [ObjectIdentifier: ServiceIdentity] = [:]
+    /// Even a cached identity is re-derived from the hardware this often, which
+    /// bounds the damage of the one hazard a reference-keyed map has: CF
+    /// allocators reuse addresses, so a deallocated service's successor could
+    /// inherit a stale label. One full re-enumeration per few minutes costs
+    /// nothing against a 1 Hz sampler.
+    private static let identityRefreshSamples = 180
+    private var samplesSinceIdentityRefresh = 0
+
     private static let eventTypeTemperature: Int64 = 15
     private static let appleVendorPage = 0xff00
     private static let temperatureSensorUsage = 0x0005
@@ -139,18 +165,36 @@ public final class TemperatureSensors: @unchecked Sendable {
         let services = servicesRef.takeRetainedValue() as [AnyObject]
         var results: [Reading] = []
 
+        // Periodically re-derive every identity from the hardware (see
+        // `identityRefreshSamples`), and otherwise trust the cache only for
+        // references seen in this same pass — anything else is looked up or
+        // read fresh, so a changed service population heals immediately.
+        let refreshAll = samplesSinceIdentityRefresh >= Self.identityRefreshSamples
+        samplesSinceIdentityRefresh = refreshAll ? 0 : samplesSinceIdentityRefresh + 1
+        var seenThisPass = Set<ObjectIdentifier>()
+
         for service in services {
-            var name = "sensor"
-            var smcKey = ""
-            if let copyProperty {
-                if let prop = copyProperty(service, "Product" as CFString),
-                   let str = prop.takeRetainedValue() as? String {
-                    name = str
+            let identifier = ObjectIdentifier(service)
+            seenThisPass.insert(identifier)
+            var name: String
+            var smcKey: String
+            if !refreshAll, let cached = identities[identifier] {
+                name = cached.name
+                smcKey = cached.smcKey
+            } else {
+                name = "sensor"
+                smcKey = ""
+                if let copyProperty {
+                    if let prop = copyProperty(service, "Product" as CFString),
+                       let str = prop.takeRetainedValue() as? String {
+                        name = str
+                    }
+                    if let prop = copyProperty(service, "LocationID" as CFString),
+                       let number = prop.takeRetainedValue() as? NSNumber {
+                        smcKey = Self.fourCC(number.uint32Value)
+                    }
                 }
-                if let prop = copyProperty(service, "LocationID" as CFString),
-                   let number = prop.takeRetainedValue() as? NSNumber {
-                    smcKey = Self.fourCC(number.uint32Value)
-                }
+                identities[identifier] = ServiceIdentity(name: name, smcKey: smcKey)
             }
             guard let eventRef = copyEvent(service, Self.eventTypeTemperature, 0, 0) else {
                 continue
@@ -165,6 +209,7 @@ public final class TemperatureSensors: @unchecked Sendable {
             results.append(Reading(name: name, celsius: value, ordinal: 0, smcKey: smcKey))
         }
 
+        identities = identities.filter { seenThisPass.contains($0.key) }
         return Self.consolidate(results)
     }
 

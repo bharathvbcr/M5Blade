@@ -261,3 +261,12 @@ Actionable tasks and open items tracked in [`ISSUES.md`](ISSUES.md):
 ## Privacy
 
 No network code. No telemetry, analytics, or crash reporting. The app requests no TCC permissions. SMC and sensor reads need no privileges; only fan writes use the root helper.
+
+## License & Acknowledgements
+
+Released under the [MIT License](LICENSE). See [NOTICE](NOTICE) and [`FEASIBILITY.md`](FEASIBILITY.md) for detailed prior-art citations:
+
+- **[agoodkind/macos-smc-fan](https://github.com/agoodkind/macos-smc-fan)** (`Ari Goodkind`) — M5 Apple Silicon `F0md` lowercase SMC key-casing discovery and `SMAppService` daemon design inspiration.
+- **[exelban/stats](https://github.com/exelban/stats)** (`Serhiy Mytrovtsiy`, MIT) — `AppleSMC` `SMCKeyData_t` layout and sensor key conventions.
+- **[fermion-star/apple_sensors](https://github.com/fermion-star/apple_sensors)** & **[vladkens/macmon](https://github.com/vladkens/macmon)** (`Vladislav K`) — `IOHIDEventSystemClient` thermal enumeration and unprivileged `IOReport` telemetry patterns.
+- **[hholtmann/smcFanControl](https://github.com/hholtmann/smcFanControl)** (`Hendrik Holtmann`), **[macmade/Hot](https://github.com/macmade/Hot)** (`Jean-David Gadina`), **[alienator88/HelperToolApp](https://github.com/alienator88/HelperToolApp)**, **[trilemma-dev/SwiftAuthorizationSample](https://github.com/trilemma-dev/SwiftAuthorizationSample)**, and the **[Asahi Linux SMC Documentation](https://asahilinux.org/docs/hw/soc/smc/)**.

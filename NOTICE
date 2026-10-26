@@ -1,0 +1,41 @@
+M5Blade
+Copyright (c) 2026 Bharath Chandra Vaddaram
+
+Acknowledgements & Prior Art
+----------------------------
+M5Blade is an independent clean-room Swift implementation, informed by hardware research,
+Apple Silicon SMC key discoveries, and architectural patterns from the following open-source
+projects and authors:
+
+- agoodkind/macos-smc-fan — Ari Goodkind
+  https://github.com/agoodkind/macos-smc-fan
+  Documented the Apple Silicon M5 (Tahoe) lowercase `F0md` vs uppercase `F0Md` SMC key casing
+  discovery and modern `SMAppService.daemon` XPC architecture.
+
+- exelban/stats — Serhiy Mytrovtsiy (MIT License)
+  https://github.com/exelban/stats
+  Reference for `AppleSMC` IOKit `SMCKeyData_t` 80-byte struct layout, `IOHIDSensor` fallback
+  patterns, and Apple Silicon sensor key conventions.
+
+- fermion-star/apple_sensors & vladkens/macmon — Vladislav K
+  https://github.com/fermion-star/apple_sensors
+  https://github.com/vladkens/macmon
+  Reference for Apple Silicon `IOHIDEventSystemClient` thermal sensor enumeration and unprivileged
+  `IOReport` power/residency telemetry.
+
+- hholtmann/smcFanControl — Hendrik Holtmann (GPL-2.0, historical prior art only)
+  https://github.com/hholtmann/smcFanControl
+  Pioneered macOS `AppleSMC` user-client control selector (`kSMCHandleYPCEvent = 2`).
+
+- macmade/Hot — Jean-David Gadina (MIT License)
+  https://github.com/macmade/Hot
+  Reference for combining `NSProcessInfo.thermalState` with `IOHIDEventSystem` temperature reads.
+
+- alienator88/HelperToolApp & trilemma-dev/SwiftAuthorizationSample
+  https://github.com/alienator88/HelperToolApp
+  https://github.com/trilemma-dev/SwiftAuthorizationSample
+  Reference patterns for `SMAppService.daemon(plistName:)` and XPC audit-token code-signing verification.
+
+- Asahi Linux Project — Apple SMC Hardware Documentation
+  https://asahilinux.org/docs/hw/soc/smc/
+  Reference documentation for the Apple Silicon RTKit-based SMC mailbox architecture.
